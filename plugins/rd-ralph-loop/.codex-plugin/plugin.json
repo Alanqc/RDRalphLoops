@@ -1,0 +1,28 @@
+{
+  "name": "rd-ralph-loop",
+  "version": "0.1.0",
+  "description": "Isolated, checkpointed three-role Ralph loops with manual Git integration.",
+  "author": {
+    "name": "Alanqc"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "R&D Ralph Loop",
+    "shortDescription": "Run isolated, checkpointed R&D loops.",
+    "longDescription": "Run interactive Planner, Implementer, and Reviewer loops in dedicated Git worktrees with scoped checkpoint commits, evidence-gated archival, and a user-controlled manual-merge handoff.",
+    "developerName": "Alanqc",
+    "category": "Productivity",
+    "capabilities": [
+      "Multi-agent orchestration",
+      "Git worktree isolation",
+      "Scoped checkpoint commits",
+      "Write",
+      "Review"
+    ],
+    "defaultPrompt": [
+      "Run this R&D task in an isolated worktree through checkpointed implementation and independent acceptance, then prepare a manual-merge handoff.",
+      "Create the four-document task pack, dedicated branch, and first checkpointed implementation loop.",
+      "Resume this Ralph loop from its current branch, plan, candidate commit, and verification evidence."
+    ]
+  }
+}
