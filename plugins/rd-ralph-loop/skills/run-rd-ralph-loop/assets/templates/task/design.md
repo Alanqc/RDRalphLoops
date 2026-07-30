@@ -16,17 +16,37 @@
 
 - [[PLANNER: State rejected or deferred technical choices.]]
 
+## Repository Participants
+
+`CONTROL` is the workspace/control repository recorded in `plan.md`; it owns the four-pack, index,
+Planner/Reviewer/Control history, archive, and candidate seal. Register every other Git worktree
+that Implementer may modify as a stable `REPO-NNN`. Use one `N/A` row when no participant
+repository is required. Worktree roots are supplied at runtime with
+`--repo REPO-NNN=/absolute/worktree` and are not accepted-document identities. Logical identity is
+an origin URL or user-approved stable repository label, never a temporary worktree path. CONTROL
+is always merged last during manual integration.
+
+| Repository | Logical identity | Branch | Base commit | Write scopes | ACs | Merge order | User authorization |
+|---|---|---|---|---|---|---:|---|
+| `REPO-001` / N/A | [[PLANNER: origin URL or stable label, or N/A]] | `ralph/{{TASK_ID}}` | [[PLANNER: full immutable base SHA, or N/A]] | [[PLANNER: repository-relative prefixes, or N/A]] | `AC-001` / N/A | 10 | Initial task request / explicit authorization |
+
+An Implementer may inspect a user-identified repository read-only to justify
+`PLAN_FEEDBACK_REQUIRED`, but may not modify it or include it in a candidate until the user
+authorizes the repository and write scopes and a fresh Planner checkpoint updates this registry.
+Repository removal, replacement, or scope expansion follows the same rule.
+
 ## Output Design
 
 Keep retained deliverables outside this four-pack directory. Use paths relative to the workspace
-root so a temporary worktree path is never embedded in an accepted deliverable identity.
+or registered participant repository so a temporary worktree path is never embedded in an
+accepted deliverable identity.
 
 Classify each output as `SUBJECT`, `ASSURANCE`, or `EVIDENCE`. `ASSURANCE` includes task-specific
 harnesses, validators, simulators, evidence generators, and their tests.
 
-| Deliverable | Class | Path | Format / interface | Owner | ACs | Guard budget | Retention |
-|---|---|---|---|---|---|---|---|
-| `DEL-001` | SUBJECT / ASSURANCE / EVIDENCE | `path/to/output` | [[PLANNER: exact form]] | [[PLANNER: owner]] | `AC-001` | `BUD-001` / EXCLUDED | Retain after four-pack archival |
+| Deliverable | Class | Repository | Path | Format / interface | Owner | ACs | Guard budget | Retention |
+|---|---|---|---|---|---|---|---|---|
+| `DEL-001` | SUBJECT / ASSURANCE / EVIDENCE | `CONTROL` / `REPO-001` | `path/to/output` | [[PLANNER: exact form]] | [[PLANNER: owner]] | `AC-001` | `BUD-001` / EXCLUDED | Retain after four-pack archival |
 
 ## Verification Boundary
 
@@ -45,7 +65,7 @@ write ownership.
 
 | Resource | Location / identity | Access | Owner | Collision avoidance |
 |---|---|---|---|---|
-| Repository files for `DEL-001` | `path/to/output` | Exclusive write | `{{TASK_ID}}` | Dedicated worktree and `{{GIT_BRANCH}}` branch |
+| Repository files for `DEL-001` | `CONTROL` / `REPO-001`: `path/to/output` | Exclusive write | `{{TASK_ID}}` | Dedicated worktree and `{{GIT_BRANCH}}` branch |
 
 ## Constraints
 

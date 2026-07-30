@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -413,6 +414,235 @@ def plan_v2(
     )
 
 
+def proposal_v3(task_id: str, run_id: str) -> str:
+    return (
+        proposal_v2(task_id, run_id)
+        .replace("| Protocol version | 2 |", "| Protocol version | 3 |", 1)
+        .replace(
+            "| Budget | Profile |",
+            "| Budget | Repository | Profile |",
+            1,
+        )
+        .replace(
+            "|---|---|---|---:|---:|---:|---:|---|---|",
+            "|---|---|---|---|---:|---:|---:|---:|---|---|",
+            1,
+        )
+        .replace(
+            "| `BUD-001` | CODE | `output.txt` | 3000 | 5000 | 12000 | "
+            "6000 | N/A | Initial task request |",
+            "| `BUD-001` | `REPO-001` | CODE | `artifact/output.txt` | 3000 | "
+            "5000 | 12000 | 6000 | N/A | Initial task request |\n"
+            "| `BUD-002` | `REPO-002` | CODE | `artifact/output.txt` | 3000 | "
+            "5000 | 12000 | 6000 | N/A | Initial task request |",
+            1,
+        )
+        .replace(
+            "THE workspace SHALL contain output.txt with the exact text `done`",
+            "THE task SHALL retain both repository-qualified outputs",
+            1,
+        )
+    )
+
+
+def design_v3(
+    task_id: str,
+    repo_1_base: str,
+    repo_2_base: str,
+) -> str:
+    branch = f"ralph/{task_id}"
+    registry = f"""## Repository Participants
+
+| Repository | Logical identity | Branch | Base commit | Write scopes | ACs | Merge order | User authorization |
+|---|---|---|---|---|---|---:|---|
+| `REPO-001` | participant-one | `{branch}` | `{repo_1_base}` | `artifact` | `AC-001` | 10 | Initial task request |
+| `REPO-002` | participant-two | `{branch}` | `{repo_2_base}` | `artifact` | `AC-001` | 20 | Initial task request |
+
+"""
+    return (
+        design_v2(task_id)
+        .replace("## Output Design\n", registry + "## Output Design\n", 1)
+        .replace(
+            "| Deliverable | Class | Path |",
+            "| Deliverable | Class | Repository | Path |",
+            1,
+        )
+        .replace(
+            "|---|---|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|---|",
+            1,
+        )
+        .replace(
+            f"| `DEL-001` | SUBJECT | `output.txt` | UTF-8 text | {task_id} | "
+            "`AC-001` | `BUD-001` | Retain |",
+            f"| `DEL-001` | SUBJECT | `REPO-001` | `artifact/output.txt` | "
+            f"UTF-8 text | {task_id} | `AC-001` | `BUD-001` | Retain |\n"
+            f"| `DEL-002` | SUBJECT | `REPO-002` | `artifact/output.txt` | "
+            f"UTF-8 text | {task_id} | `AC-001` | `BUD-002` | Retain |",
+            1,
+        )
+        .replace(
+            "| Output | `output.txt` |",
+            "| Output | `REPO-001`: `artifact/output.txt`; "
+            "`REPO-002`: `artifact/output.txt` |",
+            1,
+        )
+    )
+
+
+def plan_v3(
+    run_id: str,
+    control_worktree: Path,
+    branch: str,
+    control_base: str,
+) -> str:
+    return (
+        plan_v2(
+            run_id,
+            control_worktree,
+            branch,
+            control_base,
+            implemented=False,
+        )
+        .replace("| Protocol version | 2 |", "| Protocol version | 3 |", 1)
+        .replace(
+            "| ID | Class | ACs | Path |",
+            "| ID | Class | ACs | Repository | Path |",
+            1,
+        )
+        .replace(
+            "|---|---|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|---|",
+            1,
+        )
+        .replace(
+            "| `DEL-001` | SUBJECT | `AC-001` | `output.txt` | Yes | "
+            "`BUD-001` | Pending | Exact content check |",
+            "| `DEL-001` | SUBJECT | `AC-001` | `REPO-001` | "
+            "`artifact/output.txt` | Yes | `BUD-001` | Pending | Content hash |\n"
+            "| `DEL-002` | SUBJECT | `AC-001` | `REPO-002` | "
+            "`artifact/output.txt` | Yes | `BUD-002` | Pending | Content hash |",
+            1,
+        )
+        .replace(
+            "| [ ] | `ITEM-001` | `DEL-001`; `AC-001` | None | Implementer | "
+            "`output.txt` | Write exact content |",
+            "| [ ] | `ITEM-001` | `DEL-001`; `AC-001` | None | Implementer | "
+            "`REPO-001`: `artifact/output.txt` | Preserve first output |\n"
+            "| [ ] | `ITEM-002` | `DEL-002`; `AC-001` | None | Implementer | "
+            "`REPO-002`: `artifact/output.txt` | Preserve second output |",
+            1,
+        )
+        .replace(
+            '| `AC-001` | Command | `test "$(cat output.txt)" = done` | Exit 0 |',
+            "| `AC-001` | Snapshot | Compare repository-qualified entries | "
+            "Two distinct retained entries |",
+            1,
+        )
+    )
+
+
+def implemented_plan_v3(plan_text: str, iteration: int = 1) -> str:
+    updated = (
+        plan_text.replace("| State | Planned |", "| State | In Review |", 1)
+        .replace("| Current iteration | 0 |", f"| Current iteration | {iteration} |", 1)
+        .replace("| Next actor | Implementer |", "| Next actor | Reviewer |", 1)
+        .replace("| Pending |", "| Done |")
+        .replace("| [ ] |", "| [x] |")
+        .replace(
+            "| 0 | Planner | Four-pack | Planning only | N/A | Implementer |",
+            "| 0 | Planner | Four-pack | Planning only | N/A | Implementer |\n"
+            f"| {iteration} | Implementer | Participant outputs and plan.md | "
+            "fixture checks passed | N/A | Independent review |",
+            1,
+        )
+    )
+    if updated == plan_text:
+        raise AssertionError("protocol-v3 fixture plan did not enter review")
+    return updated
+
+
+def empty_verify_v3(run_id: str) -> str:
+    return empty_verify(run_id).replace(
+        "| Accepted candidate commit | PENDING |",
+        "| Accepted candidate commit | PENDING |\n"
+        "| Accepted candidate vector SHA-256 | PENDING |",
+        1,
+    )
+
+
+def accepted_verify_v3(
+    run_id: str,
+    candidate: str,
+    branch: str,
+    snapshot: str,
+    vector: str,
+    repositories: dict[str, tuple[str, str]],
+) -> str:
+    repository_rows = "\n".join(
+        f"| {repository} | participant-{word} | `{branch}` | `{base}` | "
+        f"`{commit}` | Yes |"
+        for repository, word, (base, commit) in (
+            ("REPO-001", "one", repositories["REPO-001"]),
+            ("REPO-002", "two", repositories["REPO-002"]),
+        )
+    )
+    return f"""# Multi-repository Verify
+
+| Field | Value |
+|---|---|
+| Run ID | `{run_id}` |
+| Evidence owner | Reviewer |
+| Final decision | ACCEPTED |
+| Accepted snapshot SHA-256 | `{snapshot}` |
+| Accepted candidate commit | `{candidate}` |
+| Accepted candidate vector SHA-256 | `{vector}` |
+
+## Review Ledger
+
+## ITER-001 Review
+
+| Field | Value |
+|---|---|
+| Reviewer | Independent fixture reviewer |
+| Date | 2026-07-30 |
+| Environment | isolated CONTROL and participant worktrees |
+| Candidate commit | `{candidate}` |
+| Candidate branch | `{branch}` |
+| Candidate vector SHA-256 | `{vector}` |
+| Snapshot SHA-256 | `{snapshot}` |
+| Verdict | ACCEPTED |
+| Residual risk | Manual integration remains user-controlled |
+
+### Candidate Repositories
+
+| Repository | Logical identity | Branch | Base commit | Candidate commit | Changed this iteration |
+|---|---|---|---|---|---|
+{repository_rows}
+
+### AC Decision Matrix
+
+| AC | Result | Evidence |
+|---|---|---|
+| AC-001 | PASS | Independently matched both repository-qualified candidate bytes |
+
+### Findings
+
+| Finding | ACs | Type | Severity | Status | Evidence | Action class | Required action |
+|---|---|---|---|---|---|---|---|
+
+### Commands
+
+| Command / review step | Expected exit | Actual exit | Result | Relevant output |
+|---|---|---|---|---|
+| repository-qualified snapshot comparison | 0 | 0 | PASS | Both immutable participant candidates matched |
+
+### Conclusion
+
+Every AC passed against the sealed multi-repository candidate vector.
+"""
+
+
 def typed_verify(
     run_id: str,
     candidate: str,
@@ -473,6 +703,129 @@ def typed_verify(
 
 The typed finding determines the next lifecycle action.
 """
+
+
+def git_repo_with_task_worktree(
+    root: Path,
+    name: str,
+    task_id: str,
+    files: dict[str, str],
+) -> tuple[Path, Path, str]:
+    integration = root / f"{name}-integration"
+    integration.mkdir()
+    run(["git", "init", "-b", "main"], cwd=integration)
+    git(integration, "config", "user.name", "Ralph Test")
+    git(integration, "config", "user.email", "ralph@example.invalid")
+    for relative, content in files.items():
+        path = integration / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    git(integration, "add", *sorted(files))
+    git(integration, "commit", "-m", f"{name} base")
+    base = git(integration, "rev-parse", "HEAD")
+    worktree = root / f"{name}-worktree"
+    cli(
+        "worktree-create",
+        "--repo-root",
+        str(integration),
+        "--worktree-path",
+        str(worktree),
+        "--task-id",
+        task_id,
+        "--base",
+        base,
+    )
+    return integration, worktree, base
+
+
+@contextmanager
+def git_v3_repository_fixture(
+    task_id: str,
+    run_id: str,
+) -> Iterator[
+    tuple[Path, Path, Path, Path, Path, str, str, str]
+]:
+    with tempfile.TemporaryDirectory(prefix="ralph-v3-repositories-") as raw:
+        root = Path(raw)
+        _, control, control_base = git_repo_with_task_worktree(
+            root,
+            "control",
+            task_id,
+            {"README.md": "control base\n"},
+        )
+        _, repo_1, repo_1_base = git_repo_with_task_worktree(
+            root,
+            "participant-one",
+            task_id,
+            {
+                "README.md": "participant one base\n",
+                "artifact/output.txt": "participant one output\n",
+                "outside/output.txt": "outside declared scope\n",
+            },
+        )
+        _, repo_2, repo_2_base = git_repo_with_task_worktree(
+            root,
+            "participant-two",
+            task_id,
+            {
+                "README.md": "participant two base\n",
+                "artifact/output.txt": "participant two output\n",
+            },
+        )
+        _, extra_repo, _ = git_repo_with_task_worktree(
+            root,
+            "undeclared-extra",
+            task_id,
+            {"README.md": "undeclared extra base\n"},
+        )
+
+        initialized = json.loads(
+            cli(
+                "init",
+                "--workspace-root",
+                str(control),
+                "--tasks-root",
+                "tasks",
+                "--task-id",
+                task_id,
+                "--title",
+                "Protocol v3 repository mapping",
+                "--run-id",
+                run_id,
+            ).stdout
+        )
+        task_dir = Path(initialized["task_dir"])
+        (task_dir / "proposal.md").write_text(
+            proposal_v3(task_id, run_id),
+            encoding="utf-8",
+        )
+        (task_dir / "design.md").write_text(
+            design_v3(task_id, repo_1_base, repo_2_base),
+            encoding="utf-8",
+        )
+        (task_dir / "plan.md").write_text(
+            plan_v3(
+                run_id,
+                control,
+                f"ralph/{task_id}",
+                control_base,
+            ),
+            encoding="utf-8",
+        )
+        (task_dir / "verify.md").write_text(
+            empty_verify_v3(run_id),
+            encoding="utf-8",
+        )
+        yield (
+            control,
+            repo_1,
+            repo_2,
+            extra_repo,
+            task_dir,
+            control_base,
+            repo_1_base,
+            repo_2_base,
+        )
 
 
 @contextmanager
@@ -1496,6 +1849,706 @@ class GitFlowTest(unittest.TestCase):
                 expected=2,
             )
             self.assertIn("linked worktree", result.stderr)
+
+
+class ProtocolV3RepositoryMappingTest(unittest.TestCase):
+    @staticmethod
+    def _repository_arguments(repo_1: Path, repo_2: Path) -> list[str]:
+        return [
+            "--repo",
+            f"REPO-001={repo_1}",
+            "--repo",
+            f"REPO-002={repo_2}",
+        ]
+
+    @classmethod
+    def _command(
+        cls,
+        command: str,
+        control: Path,
+        task_dir: Path,
+        repo_1: Path,
+        repo_2: Path,
+        *arguments: str,
+        expected: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        return cli(
+            command,
+            "--workspace-root",
+            str(control),
+            "--task-dir",
+            str(task_dir),
+            *arguments,
+            *cls._repository_arguments(repo_1, repo_2),
+            expected=expected,
+        )
+
+    @classmethod
+    def _json(
+        cls,
+        command: str,
+        control: Path,
+        task_dir: Path,
+        repo_1: Path,
+        repo_2: Path,
+        *arguments: str,
+    ) -> dict[str, object]:
+        return json.loads(
+            cls._command(
+                command,
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                *arguments,
+            ).stdout
+        )
+
+    @classmethod
+    def _planner_checkpoint(
+        cls,
+        control: Path,
+        task_dir: Path,
+        task_id: str,
+        repo_1: Path,
+        repo_2: Path,
+    ) -> dict[str, object]:
+        return cls._json(
+            "checkpoint",
+            control,
+            task_dir,
+            repo_1,
+            repo_2,
+            "--task-id",
+            task_id,
+            "--role",
+            "planner-init",
+            "--iteration",
+            "0",
+            "--index",
+            "tasks/index.md",
+        )
+
+    def test_unchanged_participant_carries_base_into_control_seal(self) -> None:
+        task_id = "TASK-V3-CARRY"
+        run_id = "RUN-V3-CARRY"
+        with git_v3_repository_fixture(task_id, run_id) as (
+            control,
+            repo_1,
+            repo_2,
+            _,
+            task_dir,
+            _,
+            repo_1_base,
+            repo_2_base,
+        ):
+            planned = self._json(
+                "validate",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--phase",
+                "planned",
+            )
+            self.assertTrue(planned["valid"], planned["errors"])
+            snapshot = self._json(
+                "snapshot",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+            )
+            entries = {entry["path"]: entry for entry in snapshot["entries"]}
+            first_path = "repo/REPO-001/artifact/output.txt"
+            second_path = "repo/REPO-002/artifact/output.txt"
+            self.assertEqual(snapshot["schema"], "rd-ralph-snapshot-v2")
+            self.assertNotEqual(
+                entries[first_path]["sha256"],
+                entries[second_path]["sha256"],
+            )
+            canonical_snapshot = json.dumps(
+                {
+                    "schema": snapshot["schema"],
+                    "entries": snapshot["entries"],
+                    "participant_commits": {
+                        "REPO-001": repo_1_base,
+                        "REPO-002": repo_2_base,
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            self.assertEqual(
+                hashlib.sha256(canonical_snapshot.encode()).hexdigest(),
+                snapshot["snapshot_sha256"],
+            )
+            self.assertNotIn(str(repo_1), canonical_snapshot)
+            self.assertNotIn(str(repo_2), canonical_snapshot)
+            planner = self._planner_checkpoint(
+                control,
+                task_dir,
+                task_id,
+                repo_1,
+                repo_2,
+            )
+            (repo_1 / "artifact/output.txt").write_text(
+                "participant one candidate\n",
+                encoding="utf-8",
+            )
+            plan_path = task_dir / "plan.md"
+            plan_path.write_text(
+                implemented_plan_v3(plan_path.read_text(encoding="utf-8")),
+                encoding="utf-8",
+            )
+
+            prepared = self._json(
+                "participant-checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--repo-id",
+                "REPO-001",
+                "--iteration",
+                "1",
+            )
+            carried = self._json(
+                "participant-checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--repo-id",
+                "REPO-002",
+                "--iteration",
+                "1",
+            )
+            self.assertEqual(prepared["status"], "prepared")
+            self.assertEqual(carried["status"], "unchanged")
+            self.assertEqual(carried["commit"], repo_2_base)
+            self.assertFalse(carried["committed"])
+
+            seal = self._json(
+                "checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--role",
+                "implementer",
+                "--iteration",
+                "1",
+            )
+            participant_commits = {
+                "REPO-001": prepared["commit"],
+                "REPO-002": repo_2_base,
+            }
+            self.assertEqual(seal["participant_commits"], participant_commits)
+            self.assertEqual(seal["advanced_participants"], ["REPO-001"])
+            full_vector = {
+                "CONTROL": seal["commit"],
+                **participant_commits,
+            }
+            expected_vector = hashlib.sha256(
+                json.dumps(
+                    full_vector,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(
+                seal["candidate_vector_sha256"],
+                expected_vector,
+            )
+            self.assertEqual(
+                seal["manual_merge_order"][-1],
+                {
+                    "repository": "CONTROL",
+                    "logical_identity": "CONTROL",
+                    "merge_order": "LAST",
+                    "commit": seal["commit"],
+                },
+            )
+            self.assertEqual(git(control, "rev-parse", "HEAD"), seal["commit"])
+            self.assertEqual(git(repo_1, "rev-parse", "HEAD"), prepared["commit"])
+            self.assertEqual(git(repo_2, "rev-parse", "HEAD"), repo_2_base)
+            self.assertEqual(
+                git(repo_2, "rev-list", "--count", f"{repo_2_base}..HEAD"),
+                "0",
+            )
+            repository_trailer = (
+                "Ralph-Repositories: "
+                + json.dumps(
+                    participant_commits,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            seal_message = git(control, "show", "-s", "--format=%B", seal["commit"])
+            self.assertIn(repository_trailer, seal_message)
+            self.assertNotIn("Ralph-Vector:", seal_message)
+            self.assertEqual(prepared["control_parent"], planner["commit"])
+            for root in (control, repo_1, repo_2):
+                self.assertEqual(git(root, "status", "--porcelain"), "")
+
+    def test_partial_failure_recovers_to_accepted_manual_handoff(self) -> None:
+        task_id = "TASK-V3-RECOVERY"
+        run_id = "RUN-V3-RECOVERY"
+        with git_v3_repository_fixture(task_id, run_id) as (
+            control,
+            repo_1,
+            repo_2,
+            _,
+            task_dir,
+            control_base,
+            repo_1_base,
+            repo_2_base,
+        ):
+            planner = self._planner_checkpoint(
+                control,
+                task_dir,
+                task_id,
+                repo_1,
+                repo_2,
+            )
+            first_output = repo_1 / "artifact/output.txt"
+            second_output = repo_2 / "artifact/output.txt"
+            first_output.write_text(
+                "participant one recovered candidate\n",
+                encoding="utf-8",
+            )
+            second_wip = "participant two preserved after hook failure\n"
+            second_output.write_text(second_wip, encoding="utf-8")
+            plan_path = task_dir / "plan.md"
+            plan_path.write_text(
+                implemented_plan_v3(plan_path.read_text(encoding="utf-8")),
+                encoding="utf-8",
+            )
+            plan_wip = plan_path.read_bytes()
+
+            hook = Path(
+                git(repo_2, "rev-parse", "--git-path", "hooks/pre-commit")
+            )
+            if not hook.is_absolute():
+                hook = repo_2 / hook
+            hook.parent.mkdir(parents=True, exist_ok=True)
+            hook.write_text(
+                "#!/bin/sh\nprintf 'injected participant failure\\n' >&2\nexit 1\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+
+            first_prepared = self._json(
+                "participant-checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--repo-id",
+                "REPO-001",
+                "--iteration",
+                "1",
+            )
+            failed_second = self._command(
+                "participant-checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--repo-id",
+                "REPO-002",
+                "--iteration",
+                "1",
+                expected=2,
+            )
+            self.assertIn("injected participant failure", failed_second.stderr)
+            self.assertEqual(
+                git(repo_1, "rev-parse", "HEAD"),
+                first_prepared["commit"],
+            )
+            self.assertEqual(git(repo_1, "status", "--porcelain"), "")
+            self.assertEqual(git(repo_2, "rev-parse", "HEAD"), repo_2_base)
+            self.assertEqual(
+                git(repo_2, "diff", "--cached", "--name-only"),
+                "",
+            )
+            self.assertEqual(second_output.read_text(encoding="utf-8"), second_wip)
+            self.assertEqual(plan_path.read_bytes(), plan_wip)
+            self.assertEqual(
+                git(control, "rev-parse", "HEAD"),
+                planner["commit"],
+            )
+
+            hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            hook.chmod(0o755)
+            second_prepared = self._json(
+                "participant-checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--repo-id",
+                "REPO-002",
+                "--iteration",
+                "1",
+            )
+            seal = self._json(
+                "checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--role",
+                "implementer",
+                "--iteration",
+                "1",
+            )
+            self.assertEqual(
+                seal["participant_commits"],
+                {
+                    "REPO-001": first_prepared["commit"],
+                    "REPO-002": second_prepared["commit"],
+                },
+            )
+            self.assertEqual(
+                seal["advanced_participants"],
+                ["REPO-001", "REPO-002"],
+            )
+            self.assertEqual(
+                seal["manual_merge_order"][-1]["repository"],
+                "CONTROL",
+            )
+            participant_commits = {
+                "REPO-001": first_prepared["commit"],
+                "REPO-002": second_prepared["commit"],
+            }
+            candidate_vector = seal["candidate_vector_sha256"]
+            (task_dir / "verify.md").write_text(
+                accepted_verify_v3(
+                    run_id,
+                    seal["commit"],
+                    f"ralph/{task_id}",
+                    seal["snapshot_sha256"],
+                    candidate_vector,
+                    {
+                        "REPO-001": (
+                            repo_1_base,
+                            participant_commits["REPO-001"],
+                        ),
+                        "REPO-002": (
+                            repo_2_base,
+                            participant_commits["REPO-002"],
+                        ),
+                    },
+                ),
+                encoding="utf-8",
+            )
+            reviewed_validation = self._json(
+                "validate",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--phase",
+                "reviewed",
+            )
+            self.assertTrue(
+                reviewed_validation["valid"],
+                reviewed_validation["errors"],
+            )
+            wrong_verify = control / "wrong-review" / "verify.md"
+            wrong_verify.parent.mkdir()
+            wrong_verify.write_text("not the task review\n", encoding="utf-8")
+            rejected_reviewer = self._command(
+                "checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--role",
+                "reviewer",
+                "--iteration",
+                "1",
+                expected=2,
+            )
+            self.assertIn("outside its authority", rejected_reviewer.stderr)
+            self.assertEqual(git(control, "rev-parse", "HEAD"), seal["commit"])
+            self.assertEqual(git(control, "diff", "--cached", "--name-only"), "")
+            wrong_verify.unlink()
+            wrong_verify.parent.rmdir()
+            reviewer = self._json(
+                "checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--role",
+                "reviewer",
+                "--iteration",
+                "1",
+            )
+            self.assertEqual(reviewer["participant_commits"], participant_commits)
+            self.assertEqual(
+                reviewer["candidate_vector_sha256"],
+                candidate_vector,
+            )
+            canonical_map = json.dumps(
+                participant_commits,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            reviewer_message = git(
+                control,
+                "show",
+                "-s",
+                "--format=%B",
+                reviewer["commit"],
+            )
+            self.assertIn(f"Ralph-Repositories: {canonical_map}", reviewer_message)
+            self.assertIn(f"Ralph-Vector: {candidate_vector}", reviewer_message)
+
+            archive = self._json(
+                "archive",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--archive-root",
+                "tasks/archive",
+                "--index",
+                "tasks/index.md",
+            )
+            archived_task = Path(archive["archived_task_dir"])
+            self.assertFalse(task_dir.exists())
+            self.assertEqual(archive["participant_commits"], participant_commits)
+            self.assertEqual(
+                archive["candidate_vector_sha256"],
+                candidate_vector,
+            )
+            index_text = (control / "tasks/index.md").read_text(encoding="utf-8")
+            self.assertIn("REPO-001:artifact/output.txt", index_text)
+            self.assertIn("REPO-002:artifact/output.txt", index_text)
+            self.assertNotIn(str(repo_1), index_text)
+            self.assertNotIn(str(repo_2), index_text)
+            extra_closure_path = control / "closure-extra.txt"
+            extra_closure_path.write_text("not part of archive\n", encoding="utf-8")
+            rejected_closure = self._command(
+                "checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--archive-task-dir",
+                str(archived_task),
+                "--index",
+                "tasks/index.md",
+                "--task-id",
+                task_id,
+                "--role",
+                "closure",
+                "--iteration",
+                "1",
+                expected=2,
+            )
+            self.assertIn("outside its authority", rejected_closure.stderr)
+            self.assertEqual(git(control, "rev-parse", "HEAD"), reviewer["commit"])
+            self.assertEqual(git(control, "diff", "--cached", "--name-only"), "")
+            extra_closure_path.unlink()
+            closure = self._json(
+                "checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--archive-task-dir",
+                str(archived_task),
+                "--index",
+                "tasks/index.md",
+                "--task-id",
+                task_id,
+                "--role",
+                "closure",
+                "--iteration",
+                "1",
+            )
+            closure_message = git(
+                control,
+                "show",
+                "-s",
+                "--format=%B",
+                closure["commit"],
+            )
+            self.assertIn(f"Ralph-Repositories: {canonical_map}", closure_message)
+            self.assertIn(f"Ralph-Vector: {candidate_vector}", closure_message)
+            handoff = self._json(
+                "handoff",
+                control,
+                archived_task,
+                repo_1,
+                repo_2,
+                "--index",
+                "tasks/index.md",
+            )
+            self.assertTrue(handoff["merge_ready"])
+            self.assertEqual(handoff["merge_mode"], "manual")
+            self.assertFalse(handoff["integration_mutated"])
+            self.assertEqual(handoff["participant_commits"], participant_commits)
+            self.assertEqual(handoff["candidate_vector_sha256"], candidate_vector)
+            self.assertEqual(
+                [item["repository"] for item in handoff["repositories"]],
+                ["REPO-001", "REPO-002", "CONTROL"],
+            )
+            self.assertEqual(
+                [item["merge_order"] for item in handoff["repositories"]],
+                [10, 20, "LAST"],
+            )
+            self.assertEqual(
+                handoff["repositories"][-1]["candidate_commit"],
+                closure["commit"],
+            )
+            self.assertEqual(
+                handoff["repositories"][-1]["accepted_candidate_commit"],
+                seal["commit"],
+            )
+            handoff_text = json.dumps(handoff, sort_keys=True)
+            self.assertNotIn(str(repo_1), handoff_text)
+            self.assertNotIn(str(repo_2), handoff_text)
+
+            expected_heads = {
+                control: closure["commit"],
+                repo_1: first_prepared["commit"],
+                repo_2: second_prepared["commit"],
+            }
+            for root, expected_head in expected_heads.items():
+                self.assertEqual(git(root, "rev-parse", "HEAD"), expected_head)
+                self.assertEqual(git(root, "status", "--porcelain"), "")
+            integration_heads = {
+                control.parent / "control-integration": control_base,
+                repo_1.parent / "participant-one-integration": repo_1_base,
+                repo_2.parent / "participant-two-integration": repo_2_base,
+            }
+            for root, expected_head in integration_heads.items():
+                self.assertEqual(git(root, "rev-parse", "HEAD"), expected_head)
+                self.assertEqual(git(root, "status", "--porcelain"), "")
+
+    def test_implementer_cannot_expand_repository_registry_or_scope(self) -> None:
+        task_id = "TASK-V3-AUTHORITY"
+        run_id = "RUN-V3-AUTHORITY"
+        with git_v3_repository_fixture(task_id, run_id) as (
+            control,
+            repo_1,
+            repo_2,
+            extra_repo,
+            task_dir,
+            _,
+            repo_1_base,
+            repo_2_base,
+        ):
+            planner = self._planner_checkpoint(
+                control,
+                task_dir,
+                task_id,
+                repo_1,
+                repo_2,
+            )
+            design_path = task_dir / "design.md"
+            original_design = design_path.read_text(encoding="utf-8")
+            extra_row = (
+                f"| `REPO-003` | participant-three | `ralph/{task_id}` | "
+                f"`{git(extra_repo, 'rev-parse', 'HEAD')}` | `artifact` | "
+                "`AC-001` | 30 | Initial task request |"
+            )
+            expanded_registry = original_design.replace(
+                "\n\n## Output Design",
+                f"\n{extra_row}\n\n## Output Design",
+                1,
+            )
+            design_path.write_text(expanded_registry, encoding="utf-8")
+            registry_result = self._command(
+                "participant-checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--repo-id",
+                "REPO-001",
+                "--iteration",
+                "1",
+                expected=2,
+            )
+            self.assertIn(
+                "Implementer changed Repository Participants contract",
+                registry_result.stderr,
+            )
+            self.assertEqual(
+                design_path.read_text(encoding="utf-8"),
+                expanded_registry,
+            )
+
+            design_path.write_text(
+                original_design.replace(
+                    "| `artifact` | `AC-001` | 10 |",
+                    "| `artifact`; `outside` | `AC-001` | 10 |",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            outside_path = repo_1 / "outside/output.txt"
+            outside_path.write_text(
+                "preserved unauthorized scope WIP\n",
+                encoding="utf-8",
+            )
+            scope_result = self._command(
+                "participant-checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--repo-id",
+                "REPO-001",
+                "--iteration",
+                "1",
+                expected=2,
+            )
+            self.assertIn(
+                "Implementer changed Repository Participants contract",
+                scope_result.stderr,
+            )
+            self.assertEqual(
+                outside_path.read_text(encoding="utf-8"),
+                "preserved unauthorized scope WIP\n",
+            )
+            self.assertEqual(git(control, "rev-parse", "HEAD"), planner["commit"])
+            self.assertEqual(git(repo_1, "rev-parse", "HEAD"), repo_1_base)
+            self.assertEqual(git(repo_2, "rev-parse", "HEAD"), repo_2_base)
+            for root in (control, repo_1, repo_2, extra_repo):
+                self.assertEqual(
+                    git(root, "diff", "--cached", "--name-only"),
+                    "",
+                )
 
 
 class ProtocolV2GuardRegressionTest(unittest.TestCase):

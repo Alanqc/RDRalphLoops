@@ -1,4 +1,4 @@
 interface:
   display_name: "R&D Ralph Loop"
-  short_description: "Run isolated, checkpointed R&D Ralph loops"
-  default_prompt: "Use $run-rd-ralph-loop to run this R&D task in an isolated worktree through checkpointed implementation, independent review, archival, and a manual-merge handoff."
+  short_description: "Run guarded single- or multi-repository R&D loops"
+  default_prompt: "Use $run-rd-ralph-loop to run this R&D task from a CONTROL workspace across any authorized participant repositories through checkpointed implementation, independent review, archival, and a manual-merge handoff."

@@ -11,9 +11,10 @@ implementation iteration and an independent Reviewer for every immutable candida
 Implementer plan consultation stays inside the same iteration and creates no candidate or review.
 Treat Reviewer acceptance as the only successful exit.
 
-The Controller owns orchestration, Git state, checkpoints, status updates, and user interaction.
-Role agents edit only their authorized files and never commit, merge, push, rebase, cherry-pick,
-stash, switch branches, reset, or remove worktrees.
+The Controller owns orchestration, Git state in the workspace/control repository and every
+registered participant repository, checkpoints, status updates, and user interaction. Role agents
+edit only their authorized files and never commit, merge, push, rebase, cherry-pick, stash, switch
+branches, reset, or remove worktrees.
 
 Read [references/protocol.md](references/protocol.md) before starting. Read
 [references/role-prompts.md](references/role-prompts.md) immediately before dispatching roles.
@@ -24,6 +25,13 @@ Resolve `<skill-root>` as the directory containing this `SKILL.md`; run bundled 
 - Dispatch every role as a background subagent with a fresh role context.
 - Keep the main task open while roles run. Use bounded waits, report meaningful progress at least
   every 60 seconds, and continue accepting user messages.
+- Treat the 60-second interval as a Controller reporting cadence, not a role or first-write
+  deadline. Fresh context isolates roles; it does not justify restarting a role that is still
+  running. File mtimes, sizes, and absent or partial writes do not establish a stall. For apparent
+  inactivity, request one status update and wait through two more bounded status cycles; continue
+  waiting if the role replies or shows observable role/tool progress. Confirm the old role has
+  stopped before dispatching at most one fresh replacement. If that replacement also meets this
+  stall test, stop and ask the user instead of restarting again.
 - Treat a message intended for the current run as steering. Forward ordinary clarifications to the
   active role when safe. If it changes the goal, scope, an AC, a design invariant, path ownership,
   or the candidate under review, interrupt or invalidate the current candidate and route through
@@ -40,11 +48,15 @@ Resolve `<skill-root>` as the directory containing this `SKILL.md`; run bundled 
 
 ## Isolate every Git loop
 
-For a Git repository, use one task ID, one linked worktree, and one branch per loop. Multiple loops
-may run on the same machine and share the Git object database, but they must not share a checkout,
-branch, Git index, or write-owned external resource.
+Use one workspace/control Git worktree for the four-pack, index, lifecycle chain, review evidence,
+archive, and final candidate seal. A task may also register zero or more participant Git
+worktrees for Implementer deliverables. Every repository uses the same task ID and its own
+`ralph/<task-id>` branch, index, immutable Base, write scopes, and manual-merge handoff.
+Multiple loops may run on the same machine, but they must not share a checkout, branch, Git index,
+write scope, or mutable external resource.
 
-Create each worktree before dispatching its Planner:
+Create the control worktree before dispatching its Planner. Create each known participant
+worktree the same way, against that repository's own integration checkout and Base:
 
 ```bash
 python3 <skill-root>/scripts/ralph_loop.py worktree-create \
@@ -55,7 +67,7 @@ python3 <skill-root>/scripts/ralph_loop.py worktree-create \
 ```
 
 This creates `ralph/<task-id>` without `--force` and never removes it. If the user or Codex app
-already created a dedicated worktree, validate it instead:
+already created a dedicated control or participant worktree, validate it instead:
 
 ```bash
 python3 <skill-root>/scripts/ralph_loop.py git-context \
@@ -65,19 +77,30 @@ python3 <skill-root>/scripts/ralph_loop.py git-context \
   --require-clean
 ```
 
-Pass the same absolute worktree root, branch, base commit, task directory, and run ID to every role.
+Pass the same control root, task directory, run ID, and complete repository mapping to every role.
+For Protocol v3, append one `--repo REPO-NNN=/absolute/participant-worktree` for every participant
+to every `guard`, `control`, `snapshot`, `validate`, `checkpoint`, `archive`, and `handoff`
+invocation. The mapping is machine-local; accepted documents identify repositories by stable
+`REPO-NNN`, logical identity, branch, and Base rather than temporary worktree paths. V3 command
+examples below omit these repeated arguments for readability; append the complete mapping to each
+one. A Protocol-v3 task with an `N/A` participant row is the CONTROL-only compatibility profile:
+pass no `--repo`, retain the legacy snapshot shape, and record candidate-vector fields as `N/A`.
+
 Choose globally unique task IDs. Declare exclusive ownership for deliverable paths, generated
 directories, databases, ports, caches, devices, and external publication targets. If active loops
 overlap on any mutable resource, mark the dependency and serialize those Implementer passes or
-pause as `BLOCKED`.
+pause as `BLOCKED`. Never map two repository IDs to one worktree or nest a participant worktree
+inside another registered repository.
 
 A readiness child task must reference its paused parent, parent Base/candidate, transferred paths,
 returned deliverables, and parent resume predicate. The child has exclusive write ownership of
 transferred paths until handback; the parent stays paused and must not compete for them. A child
 cannot claim the parent's live acceptance.
 
-For a non-Git workspace, skip worktree and checkpoint commands and retain the content-snapshot
-workflow.
+For a non-Git workspace with no participant repositories, skip worktree and checkpoint commands
+and retain the content-snapshot workflow. A multi-repository candidate vector requires `CONTROL`
+to be a Git worktree because its final checkpoint is the authoritative seal for all participant
+commits.
 
 ## Establish the local contract
 
@@ -95,14 +118,16 @@ workflow.
      --title "<task title>"
    ```
 
-4. Keep deliverables outside the task-pack directory and use workspace-relative paths. Archival
-   moves the four-pack; it must not move or delete deliverables.
+4. Keep deliverables outside the task-pack directory and use paths relative to their named
+   repository. Archival moves the four-pack in `CONTROL`; it must not move or delete participant
+   deliverables.
 5. Register the active task in the branch-local index. The helper updates only its marker-managed
    index; update a project-specific index according to that repository's contract.
 
 The helper's lifecycle schema is normative only for the bundled templates. With a project-specific
-four-pack, keep repository-native gates, pass nonstandard deliverables through repeated
-`--artifact <path>` arguments, and enforce the same role, Git, and evidence invariants manually.
+four-pack, keep repository-native gates, pass nonstandard control deliverables through repeated
+`--artifact <path>` arguments and participant deliverables as
+`--artifact REPO-NNN=<path>`, and enforce the same role, Git, and evidence invariants manually.
 
 ## Initialize with the Planner
 
@@ -112,15 +137,22 @@ Dispatch a fresh Planner. Require it to complete all four files before implement
   register every blocking external dependency and immutable unblock proof plus guarded deliverable
   path budgets.
 - `design.md`: define the approach, minimum verification boundary, interfaces, risks, decisions,
-  exact deliverable paths, classes, owners, formats, retention, and concurrent resource ownership.
+  exact deliverable paths, classes, owners, formats, retention, concurrent resource ownership, and
+  the immutable Repository Participants registry.
 - `plan.md`: map every `DEL-*` and `ITEM-*` to `AC-*`, include dependencies and executable
   verification methods, and record worktree, branch, base commit, and manual merge mode.
 - `verify.md`: create only the empty review schema. Do not pre-fill evidence or a verdict.
 
 The Planner owns `proposal.md`. A material goal, scope, or AC change requires explicit user
 authorization and a recorded re-baseline; never weaken criteria to fit the implementation.
-Adding a deliverable/path, budget, schema generation, provider, phase, public interface, or
-assurance surface after initialization also requires explicit user authorization. An authorization
+Adding a repository, repository write scope, deliverable/path, budget, schema generation, provider,
+phase, public interface, or assurance surface after initialization also requires explicit user
+authorization. An Implementer may inspect a user-identified repository read-only when needed to
+justify `PLAN_FEEDBACK_REQUIRED`, but must not modify it or include it in a candidate until a fresh
+Planner checkpoint registers it. The executable order is: user authorizes the proposed logical
+identity and scopes; Controller creates or validates its dedicated worktree; Planner records its
+ID, identity, branch, Base, scopes, ACs, merge order, and authorization; Controller creates the
+fresh CONTROL Planner checkpoint; only then may Implementer mutate it. An authorization
 token/reference is a non-secret audit identifier, not an authentication credential.
 
 Guard measurement is intentionally limited to physical line counts and
@@ -146,21 +178,24 @@ python3 <skill-root>/scripts/ralph_loop.py checkpoint \
   --index <task-index>
 ```
 
-The checkpoint refuses a dirty staging area, out-of-role paths, detached or wrong branches, and
-primary-worktree use unless an explicitly serialized single-loop run passes
-`--allow-primary-worktree`. It pins Base to the parent of Planner iteration 0 and authenticates
-every later commit as the same task's linear Ralph checkpoint chain.
+The checkpoint refuses a dirty staging area, out-of-role paths, detached or wrong branches,
+unmapped or mismatched participant repositories, and primary-worktree use unless an explicitly
+serialized single-loop run passes `--allow-primary-worktree`. It pins the control Base to the
+parent of Planner iteration 0, validates every participant Base/branch/write scope, and
+authenticates every later control commit as the same task's linear Ralph checkpoint chain.
 
 ## Run one iteration
 
 For iteration `N`:
 
 1. Run Planner first only for initialization or a re-entry trigger. After re-entry, checkpoint with
-   `--role planner-replan --iteration N`. Add `--allow-contract-change` only after the user
-   explicitly authorizes a proposal/AC re-baseline. Require a disposition for every triggering
-   `F-*`/`PQ-*`, what was removed or replaced, the budget delta, and the next direct subject
-   evidence. New deliverables/paths, budgets, schema generations, providers, phases, interfaces, or
-   assurance layers require explicit user authorization, not merely Controller preference.
+   `--role planner-replan --iteration N`. Add `--allow-contract-change` and
+   `--authorization-token <non-secret-user-reference>` only after the user explicitly authorizes
+   a proposal/AC re-baseline, repository-registry change, scope expansion, or other controlled
+   contract change. Require a disposition for every triggering `F-*`/`PQ-*`, what was removed or
+   replaced, the budget delta, and the next direct subject evidence. New deliverables/paths,
+   budgets, schema generations, providers, phases, interfaces, or assurance layers require
+   explicit user authorization, not merely Controller preference.
 
    ```bash
    python3 <skill-root>/scripts/ralph_loop.py guard \
@@ -171,11 +206,14 @@ For iteration `N`:
    ```
 
    Checkpoint the Planner only when the guard returns `CONTINUE`.
-2. Run Implementer. Require it to update deliverables and `plan.md`, run declared checks, and record
-   changed paths, commands, results, and unresolved issues. It may amend `design.md` only when
-   necessary and must log why. It must not edit `proposal.md` or `verify.md`.
-   - If it discovers an ambiguous, contradictory, infeasible, ownership-breaking, or
-     expansion-requiring plan, stop before candidate creation with `PLAN_FEEDBACK_REQUIRED`.
+2. Run Implementer. Require it to update deliverables in `CONTROL` and registered participant
+   repositories plus `plan.md`, run declared checks, and record changed paths, commands, results,
+   and unresolved issues. It may amend `design.md` only when necessary and must log why, but may
+   not add/remove a repository or expand its write scopes. It must not edit `proposal.md` or
+   `verify.md`.
+   - If it discovers an ambiguous, contradictory, infeasible, ownership-breaking, new-repository,
+     or expansion-requiring plan, stop before touching the undeclared scope or creating a candidate
+     with `PLAN_FEEDBACK_REQUIRED`.
      Require a stable `PQ-NNN`, affected `ITEM-*`/`DEL-*`/`AC-*`, whether WIP exists, continue-risk,
      and a recommendation.
    - Record a plan-query Control event and dispatch a fresh Planner for read-only consultation.
@@ -189,7 +227,8 @@ For iteration `N`:
      external blockers pause as `EXTERNAL`.
    - A second consultation in the same implementation iteration pauses as `PLAN_CONFLICT` before
      more planning churn is allowed.
-3. After the Implementer returns, inspect all worktree changes and create the immutable candidate:
+3. After the Implementer returns, inspect every registered worktree and create the immutable
+   multi-repository candidate:
 
    First run the Implementer guard. If it returns a pause decision, record an empty Control pause
    checkpoint, preserve all tracked and untracked WIP unstaged, and do not create a candidate or
@@ -202,6 +241,16 @@ For iteration `N`:
      --task-dir <task-dir> \
      --task-id <task-id>
 
+   python3 <skill-root>/scripts/ralph_loop.py participant-checkpoint \
+     --workspace-root <control-worktree> \
+     --task-dir <task-dir> \
+     --task-id <task-id> \
+     --repo REPO-001=<participant-worktree> \
+     --repo-id REPO-001 \
+     --iteration N
+
+   # Repeat participant-checkpoint in REPO-NNN order for each changed participant,
+   # then seal the candidate in CONTROL.
    python3 <skill-root>/scripts/ralph_loop.py checkpoint \
      --workspace-root <worktree> \
      --task-dir <task-dir> \
@@ -210,14 +259,22 @@ For iteration `N`:
      --iteration N
    ```
 
-   The Controller stages only the validated explicit paths. Never use repository-wide
-   `git add -A` or `git commit -a`. The checkpoint returns the full candidate commit and content
-   snapshot and records both in commit trailers. If an authorized Implementer design amendment
-   introduces a new deliverable path that was not present in the preceding checkpoint, inspect it
-   and pass one `--allow-new-deliverable <path>` per new path; otherwise the checkpoint refuses it.
-   Prefer Planner re-entry when the ownership change is material. A declared or explicit
+   The Controller stages only validated paths in one repository at a time. Never use
+   repository-wide `git add -A` or `git commit -a`. Participant commits are recoverable prepared
+   commits, not candidates by themselves. The final control checkpoint seals their full commit
+   map and the global content snapshot; only that control commit is the candidate root. If a later
+   participant commit fails, preserve earlier prepared commits and WIP—never reset or amend them—and
+   do not dispatch Reviewer until the control seal succeeds. All prepared commits share the
+   CONTROL HEAD used by the first participant as their preparation anchor. An audited
+   configuration pause/resume may add only Control-event descendants before sealing; any
+   intervening substantive checkpoint makes the prepared batch stale and requires user handling.
+
+   If an authorized design amendment introduces a new deliverable path in an already registered
+   repository, inspect it and pass one repository-qualified
+   `--allow-new-deliverable REPO-NNN=<path>`; otherwise the checkpoint refuses it. New repositories
+   and write-scope expansions require Planner re-entry, not this flag. A declared or explicit
    deliverable may not overlap the four-pack directory. Snapshot members with non-default Git
-   index flags are refused, and candidate-tree blobs must match the filesystem bytes exactly.
+   index flags are refused, and every candidate-tree blob must match the filesystem bytes exactly.
 4. Reproduce the candidate snapshot from the clean commit:
 
    ```bash
@@ -226,13 +283,15 @@ For iteration `N`:
      --task-dir <task-dir>
    ```
 
-5. Run a fresh independent Reviewer. Give it the task pack, declared deliverables, implementation
-   evidence, exact candidate commit, branch, and snapshot; never give it a desired verdict.
+5. Run a fresh independent Reviewer. Give it the task pack, repository registry, declared
+   deliverables, implementation evidence, exact control candidate commit, full participant commit
+   map, candidate-vector digest, and snapshot; never give it a desired verdict.
 6. The Reviewer may inspect files and run checks but may modify only `verify.md`. It appends exactly
    one review record, maps every finding to `AC-*`, classifies it as `SUBJECT_DEFECT`,
    `ASSURANCE_DEFECT`, `CONTRACT_GAP`, or `EXTERNAL_BLOCKER`, records independently observed
    evidence, direct subject evidence delta, external blocker delta, assurance surface delta,
-   `Candidate commit`, `Candidate branch`, and snapshot, then emits exactly one verdict:
+   `Candidate commit`, `Candidate branch`, the Candidate Repositories matrix, candidate-vector
+   digest, and snapshot, then emits exactly one verdict:
    `ACCEPTED`, `CHANGES_REQUIRED`, `NEEDS_REPLAN`, or `BLOCKED`.
    `NEEDS_REPLAN` requires an open `CONTRACT_GAP`; `BLOCKED` requires an open
    `EXTERNAL_BLOCKER` preventing a required AC. An `ASSURANCE_DEFECT` must have a concrete reachable
@@ -240,7 +299,9 @@ For iteration `N`:
    recomputation from immutable evidence, or a minimum local repair within existing interfaces.
    Record one action class: `SUBJECT_FIX`, `SHRINK_ASSURANCE`, `DIRECT_RECOMPUTE`,
    `MINIMAL_LOCAL_FIX`, `REPLAN`, `UNBLOCK_EXTERNAL`, `CLOSE`, or `ESCALATE`. Open assurance
-   findings may use only the three assurance-specific classes or `ESCALATE`.
+   findings may use only the three assurance-specific classes or `ESCALATE`. Normalize
+   machine-local roots in durable Reviewer environment/command evidence to `<CONTROL_WORKTREE>`
+   and `<REPO-NNN_WORKTREE>` without changing argv structure, exit codes, or relevant output.
 7. Validate the review before committing it:
 
    ```bash
@@ -257,9 +318,9 @@ For iteration `N`:
      --iteration N
    ```
 
-   The Reviewer checkpoint accepts only `verify.md` changes, preserves every prior review block,
-   and verifies that the recorded candidate equals the pre-review HEAD and its Implementer
-   trailers.
+   The Reviewer checkpoint accepts only control-repository `verify.md` changes, preserves every
+   prior review block, and verifies that the recorded control candidate and every participant
+   commit equal the immutable candidate vector and their Implementer trailers.
 8. Route the verdict:
 
    - `ACCEPTED`: run the accepted gate, close, archive, and hand off.
@@ -344,7 +405,8 @@ reviewed candidate commit.
 
 After exact archive-ready bytes are accepted:
 
-1. Preserve deliverables at their owner paths.
+1. Preserve deliverables at their owner paths and keep every participant worktree clean at its
+   accepted candidate commit.
 2. Move the complete four-pack byte-for-byte to the archive and update the branch-local index in
    the same closure change. With the bundled marker-managed index, run:
 
@@ -383,11 +445,14 @@ After exact archive-ready bytes are accepted:
      --index <task-index>
    ```
 
-The handoff reports base, branch, candidate, closure commit, accepted snapshot, commits, paths,
-deliverables, Control events, and checks. It never merges, pushes, rebases, cherry-picks, deletes a
-worktree, or creates an integration queue. Leave the branch and worktree for the user to merge and
-clean up manually. Branch-local index conflicts are resolved by the user. If conflict resolution
-changes an accepted snapshot member, run a new Implementer -> Reviewer pass on the merged bytes.
+The handoff reports the control Base/branch/candidate/closure, accepted content snapshot,
+candidate-vector digest, and every participant's repository ID, Base, branch, candidate, changed
+paths, and planned manual-merge order. It never merges, pushes, rebases, cherry-picks, deletes a
+worktree, or creates an integration queue. Leave every branch and worktree for the user to merge
+and clean up manually. Cross-repository commits are not an atomic transaction, and merging only a
+subset does not integrate the accepted vector. Branch-local index conflicts are resolved by the
+user. If conflict resolution changes an accepted snapshot member, run a new Implementer ->
+Reviewer pass on the merged bytes.
 
 Closure is immutable and terminal. Do not reopen or move an archived four-pack after Closure. Any
 post-Closure change starts a new superseding task that references the archived parent.
@@ -399,8 +464,9 @@ and handoff.
 ## Preserve role and evidence boundaries
 
 - Only Reviewer can emit `ACCEPTED`; only Controller can create Git checkpoints.
-- Bind acceptance to proposal, design, plan, declared deliverables, candidate commit, and snapshot.
-  Exclude `verify.md` from the content snapshot so Reviewer can append evidence.
+- Bind acceptance to proposal, design, plan, declared deliverables, the control candidate,
+  participant commit vector, vector digest, and content snapshot. Exclude `verify.md` from the
+  content snapshot so Reviewer can append evidence.
 - Keep Reviewer history append-only and failed candidates reachable; never amend reviewed commits.
 - Make each rejection actionable with stable `F-*` IDs and `AC-*` mappings.
 - Do not archive `BLOCKED`, `CHANGES_REQUIRED`, or `NEEDS_REPLAN`.

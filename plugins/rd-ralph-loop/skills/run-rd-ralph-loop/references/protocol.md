@@ -59,13 +59,13 @@ unstaged WIP is preserved, and no candidate or Reviewer is created while paused.
 | Concern | Authority |
 |---|---|
 | Goal, scope, non-goals, ACs | `proposal.md`, Planner-owned |
-| Technical approach and output shape | `design.md`; Implementer may amend with rationale |
+| Technical approach, output shape, repository registry | `design.md`; Implementer may amend ordinary design details with rationale, but repository membership/write scopes require Planner plus user authorization |
 | Progress, tasks, commands, handoff | `plan.md`, Implementer-owned after initialization |
 | Pause, resume, abandon, split, plan-query, plan-response events | Controller-owned append-only Control checkpoints; non-Git fallback ledger in `plan.md` |
 | Evidence, findings, verdict | `verify.md`, Reviewer-owned and append-only |
 | Current/archived task registration | Project task index |
 | Stable deliverable body | Declared owner path outside the task pack |
-| Role dispatch, user steering, Git staging and commits | Controller |
+| Role dispatch, user steering, Git staging and commits in every registered repository | Controller |
 | Merge, cherry-pick, push, conflict resolution, worktree cleanup | User |
 
 Repository-local instructions and templates override the bundled defaults. Do not duplicate a
@@ -73,6 +73,10 @@ stable deliverable body into the task pack; link it and preserve its identity in
 When a local Verify schema has AC records and a Final Review instead of `ITER-NNN` sections, retain
 those required sections and append an equivalent round ledger; do not replace the local contract to
 make the bundled validator happy.
+
+Existing Protocol-v1/v2 runs remain legacy single-repository runs. A Protocol-v3 registry with one
+`N/A` row and no participant mappings is the CONTROL-only compatibility profile: it retains the
+legacy content snapshot and records participant matrix/vector fields as `N/A`.
 
 ## Required traceability
 
@@ -84,6 +88,8 @@ make the bundled validator happy.
 - Give each reviewer finding a stable `F-NNN` ID and one or more AC links.
 - Give each external dependency a stable `DEP-NNN` ID and every task-specific guard budget a stable
   `BUD-NNN` ID.
+- Give every participant repository a stable `REPO-NNN` ID. `CONTROL` is reserved for the
+  workspace/control repository and is not a participant ID.
 - Give each Implementer plan query a stable `PQ-NNN` ID.
 - Never reuse an ID for a different meaning. Preserve superseded history.
 
@@ -92,16 +98,25 @@ decision matrix. A summary is not a substitute for AC-level evidence.
 
 ## Worktree and concurrency contract
 
-- For Git work, allocate one globally unique task ID, one linked worktree, and one
-  `ralph/<TASK-ID>` branch per loop. Record the absolute worktree root, full base commit, branch,
-  and manual merge mode before planning.
-- Give every role the same absolute worktree root and require all tools to use it as cwd.
-- Never run two write-capable roles concurrently in one worktree.
+- For Git work, allocate one globally unique task ID and one workspace/control linked worktree.
+  It exclusively owns the four-pack, index, lifecycle checkpoints, Reviewer evidence, archive,
+  and control candidate seal.
+- Register zero or more participant repositories in `design.md`. Each participant uses one
+  dedicated linked worktree, the same task ID, its own `ralph/<TASK-ID>` branch, immutable Base,
+  user-approved logical identity, repository-relative write scopes, AC links, and unique numeric
+  manual-merge order. Supply machine-local roots at runtime as
+  `--repo REPO-NNN=/absolute/worktree`; never treat those roots as accepted identity. CONTROL is
+  always the last manual-integration target.
+- Give every role the same control root, task directory, run ID, and complete repository mapping.
+- Never run two write-capable roles concurrently in any registered worktree.
 - Declare exclusive write ownership for repository paths and non-repository mutable resources.
   Shared databases, ports, caches, generated directories, devices, and publication targets count
   as conflicts even when worktree paths differ.
 - If active loops have overlapping ownership, establish an explicit dependency and serialize their
   Implementer passes or pause one as `BLOCKED`.
+- Reject missing/extra repository mappings, duplicate/nested roots, wrong branches or Bases,
+  primary worktrees without explicit serialized-loop authorization, nonempty indexes, unmerged
+  operations, and changes outside repository-specific scopes.
 - A readiness child task must record its paused parent task, parent Base/candidate, transferred
   paths, returned deliverables, and parent resume predicate. Transferred paths have exactly one
   active write owner: the parent remains paused and must not write them until the child returns
@@ -116,6 +131,13 @@ decision matrix. A summary is not a substitute for AC-level evidence.
 
 - Spawn one fresh background role at a time for a loop and remain available in the main thread.
 - Use bounded waits and send meaningful status updates at least every 60 seconds.
+- Treat the 60-second interval as a Controller reporting cadence, not a role or first-write
+  deadline. Fresh context isolates roles; it does not justify restarting a role that is still
+  running. File mtimes, sizes, and absent or partial writes do not establish a stall. For apparent
+  inactivity, request one status update and wait through two more bounded status cycles; continue
+  waiting if the role replies or shows observable role/tool progress. Confirm the old role has
+  stopped before dispatching at most one fresh replacement. If that replacement also meets this
+  stall test, stop and ask the user instead of restarting again.
 - Accept user steering while a role runs. Forward non-material clarifications when safe.
 - A change to goal, scope, AC, design invariant, path ownership, or reviewed bytes invalidates the
   current candidate. Interrupt or let the role stop safely, record the change, and route through
@@ -135,8 +157,8 @@ decision matrix. A summary is not a substitute for AC-level evidence.
 
 Roles never mutate Git history or shared Git control state. They must not stage, commit, amend,
 merge, rebase, cherry-pick, push, stash, switch branches, reset, run repository maintenance, or
-remove worktrees. The Controller creates every checkpoint after verifying the role's filesystem
-changes.
+remove worktrees. The Controller creates every checkpoint in every registered repository after
+verifying the role's filesystem changes.
 
 | Checkpoint | Allowed paths | Required identity |
 |---|---|---|
@@ -147,12 +169,39 @@ changes.
 | Control event | No staged paths; empty checkpoint | Task, action, lifecycle/reasons or query/response payload, user authorization when required |
 | Closure | Active four-pack deletion, archived four-pack addition, index | Task, Closure, iteration, accepted candidate/snapshot |
 
+Protocol-v3 Implementer checkpointing is deliberately ordered rather than falsely atomic:
+
+1. Preflight `CONTROL` and every participant before staging anything.
+2. In stable `REPO-NNN` order, create an Implementer checkpoint only in each changed participant.
+   Each records task, repository ID, iteration, and the control HEAD against which it was prepared.
+   An unchanged participant retains its previous candidate/Base without an empty commit.
+3. Create the `CONTROL` Implementer checkpoint last. It may be empty when only participants
+   changed, and seals the canonical participant commit map plus the global content snapshot.
+4. Only the control seal is the immutable candidate root and permits Reviewer dispatch.
+
+If a participant commit fails, keep any earlier prepared commits and all remaining WIP. Do not
+reset, amend, manufacture a control seal, or start Reviewer. Retry the remaining preparation when
+safe or pause as `CONFIGURATION_GAP`.
+
+The CONTROL HEAD used by the first participant checkpoint is the preparation anchor for that
+iteration. On restart, take the previous sealed participant map—or each registered Base when no
+seal exists—as the expected parent map. A prepared HEAD is reusable only when it is the direct
+child of that expected commit and its task, repository, iteration, and control-parent trailers
+match the one shared preparation anchor. The anchor must remain an ancestor of current CONTROL
+HEAD, and every intervening CONTROL commit must be a Control event that still leaves the same
+Implementer iteration expected; this permits an audited configuration pause/resume without
+discarding prepared commits. Continue only the still-unprepared repositories using that same
+anchor. Any intervening substantive checkpoint, divergent anchor, extra commit, or ambiguous
+participant history pauses as `CONFIGURATION_GAP`; never reset it automatically.
+
 Before each checkpoint, require the staging area to be empty and reject unmerged files or any
 dirty/untracked path outside the role allowlist. Stage only the validated explicit path set with a
 path-scoped command. Repository-wide `git add -A`, `git commit -a`, and blanket pathspecs are
-forbidden. Require a non-empty commit, verify its actual path set, and require a clean worktree
-afterward. A required path that is ignored or otherwise absent from both the index and validated
-change set is an error; a local file alone is never proof that manual integration will retain it.
+forbidden. Require a non-empty participant or ordinary role commit, verify its actual path set,
+and require a clean worktree afterward. The final CONTROL Implementer seal is the sole exception:
+it may be an empty commit when at least one participant advanced. A required path that is ignored
+or otherwise absent from both the index and validated change set is an error; a local file alone
+is never proof that manual integration will retain it.
 
 Treat the parent of Planner iteration 0 as the immutable Base. Before every later checkpoint,
 authenticate every commit from that Base to HEAD as a linear Ralph chain for the same task and
@@ -164,10 +213,13 @@ Control checkpoints are part of that linear chain but never candidates. They mus
 capture, discard, reset, or hide WIP. A plan-query or plan-response Control event is an audit event,
 not a Reviewer verdict. A formal Planner file edit still requires a clean, role-scoped worktree.
 
-For an Implementer checkpoint, derive the path allowlist from both the preceding committed plan and
-the current plan. A newly declared deliverable path requires explicit user authorization recorded
-by the Controller after inspection; prefer Planner re-entry for material ownership changes. This
-prevents an Implementer from expanding its own write authority merely by editing `plan.md`.
+For an Implementer checkpoint, derive each repository's path allowlist from its registered write
+scopes and both the preceding committed plan and current plan. A newly declared deliverable path
+inside an existing scope requires explicit user authorization recorded by the Controller after
+inspection; prefer Planner re-entry for material ownership changes. A new repository, repository
+replacement/removal, or write-scope expansion always requires plan feedback, explicit user
+authorization, and a fresh Planner checkpoint. This prevents an Implementer from expanding its own
+commit authority merely by editing `plan.md` or `design.md`.
 Required, optional, and explicit deliverable paths must not be inside the four-pack directory or be
 an ancestor that contains it.
 
@@ -186,7 +238,23 @@ Ralph-Iteration: 2
 Ralph-Snapshot: <sha256>
 ```
 
+Each prepared participant additionally records:
+
+```text
+Ralph-Repository: REPO-001
+Ralph-Control-Parent: <full pre-seal CONTROL HEAD>
+```
+
+The final CONTROL Implementer seal records one compact, key-sorted JSON object:
+
+```text
+Ralph-Repositories: {"REPO-001":"<full-sha>","REPO-002":"<full-sha>"}
+```
+
 Reviewer and Closure checkpoints additionally record `Ralph-Candidate` and `Ralph-Verdict`.
+For Protocol v3, the control Implementer seal records one canonical participant map. Reviewer and
+Closure bind the SHA-256 of the full vector consisting of the control candidate plus every
+participant candidate. Do not use repeated same-name trailers because parsers may collapse them.
 Never write a commit's own SHA into a snapshot member such as `plan.md`; that creates a
 self-reference. Candidate SHA belongs in `verify.md`, the index archive record, Git history, and
 the final handoff.
@@ -207,8 +275,11 @@ At initialization:
    budgets in `proposal.md` before implementation. Task-specific budgets require initialization
    authorization; otherwise use the CODE or DOCUMENT defaults.
 6. Specify deliverables precisely in `design.md` and trace them in `plan.md`.
-7. Leave `verify.md` as an empty schema with `Final decision: PENDING`.
-8. Do not implement deliverables.
+7. For Protocol v3, register every participant repository before implementation with stable ID,
+   logical identity, branch, full Base, write scopes, AC links, merge order, and authorization.
+   `CONTROL` remains defined by the plan's worktree/branch/Base and is integrated last.
+8. Leave `verify.md` as an empty schema with `Final decision: PENDING`.
+9. Do not implement deliverables.
 
 On re-entry:
 
@@ -220,7 +291,12 @@ On re-entry:
   contract re-baseline.
 - Record the reason, affected ACs, replacement text, and triggering IDs in the change logs.
 - Obtain explicit user authorization before changing goal, scope, an AC, deliverable/path
-  ownership, budget, schema generation, provider, phase, public interface, or assurance surface.
+  ownership, repository membership/write scopes, budget, schema generation, provider, phase,
+  public interface, or assurance surface.
+- For a new participant, follow this order: the user authorizes its logical identity and scopes;
+  Controller creates or validates its dedicated worktree; Planner records ID, identity, branch,
+  Base, scopes, ACs, merge order, and authorization; Controller checkpoints that registry change
+  in CONTROL; only then may Implementer mutate the participant.
 - Never delete or weaken an AC merely because it failed.
 - Prefer contraction: state what is removed or replaced. Do not answer a failed assurance layer by
   adding another assurance layer without a pause and explicit authorization.
@@ -238,7 +314,7 @@ iteration also pauses as `PLAN_CONFLICT` before more planning churn is allowed.
 Every implementation iteration has an Implementer. The same Implementer may resume after a
 `CLARIFIED` consultation and may:
 
-- edit declared deliverables;
+- edit declared deliverables in `CONTROL` and registered participant repositories;
 - update `plan.md`;
 - amend `design.md` when implementation reveals a real design issue.
 
@@ -247,8 +323,9 @@ iteration, record either a substantive change or a precise blocker. Record chang
 exit codes, relevant output, remaining failures, and any design amendment.
 
 If the plan is ambiguous, contradictory, infeasible, outside declared ownership, or would require
-an unauthorized deliverable, verification surface, interface, or budget expansion, stop before
-candidate creation and return `PLAN_FEEDBACK_REQUIRED`. Supply a stable `PQ-NNN`, affected
+an undeclared repository, repository-scope change, unauthorized deliverable, verification surface,
+interface, or budget expansion, stop before touching that scope or creating a candidate and return
+`PLAN_FEEDBACK_REQUIRED`. Supply a stable `PQ-NNN`, affected
 `ITEM-*`/`DEL-*`/`AC-*`, the problem, whether WIP exists, the risk of continuing, and one
 recommendation: clarify, replan, descope, or block. The Controller records a plan-query event and
 dispatches a fresh Planner consultation. Do not manufacture a candidate merely to obtain Reviewer
@@ -264,27 +341,34 @@ repository-equivalent, and make the next step "Independent review."
 
 ## Reviewer contract
 
-Use a fresh agent that did not implement the candidate. The Reviewer is read-only except for
-appending one review record to `verify.md`.
+Use a fresh agent that did not implement the candidate. The Reviewer is read-only across every
+registered repository except for appending one review record to control-repository `verify.md`.
 
 The Reviewer must:
 
-1. Inspect actual diffs and declared deliverables, not only the Implementer's summary.
-2. Re-run proportionate tests/checks independently.
-3. Compare the candidate to every proposal AC and the design.
-4. Record environment, inputs, commands, exit codes, relevant output, paths, full candidate commit,
-   candidate branch, snapshot, residual risk, direct subject evidence delta, external blocker
-   delta, and assurance surface delta.
-5. Give every finding exactly one type, preserve finding IDs across iterations, and state whether
+1. Authenticate the control candidate seal, participant commit map, full candidate-vector digest,
+   clean worktrees, and exact HEAD in every repository.
+2. Inspect actual diffs and declared deliverables in every repository, not only the Implementer's
+   summary.
+3. Re-run proportionate tests/checks independently.
+4. Compare the candidate vector to every proposal AC and the design.
+5. Record environment, inputs, commands, exit codes, relevant output, paths, full control candidate
+   commit, Candidate Repositories matrix, vector digest, snapshot, residual risk, direct subject
+   evidence delta, external blocker delta, and assurance surface delta.
+   Normalize runtime roots in durable evidence to `<CONTROL_WORKTREE>` and
+   `<REPO-NNN_WORKTREE>` while preserving argv structure; never archive an absolute participant
+   worktree path as repository identity.
+6. Give every finding exactly one type, preserve finding IDs across iterations, and state whether
    each is Open or Closed.
-6. Record the exact snapshot SHA-256 produced by `snapshot`.
-7. Emit only `ACCEPTED`, `CHANGES_REQUIRED`, `NEEDS_REPLAN`, or `BLOCKED`.
+7. Record the exact snapshot SHA-256 produced by `snapshot`.
+8. Emit only `ACCEPTED`, `CHANGES_REQUIRED`, `NEEDS_REPLAN`, or `BLOCKED`.
 
-Before review starts, the Controller must create the Implementer candidate checkpoint. During
-review, that commit is immutable and is the worktree HEAD; Reviewer may leave only `verify.md`
-dirty. The Reviewer checkpoint verifies the candidate's task, role, iteration, and snapshot
-trailers before committing the review record, and rejects any rewrite or deletion of a prior
-review block.
+Before review starts, the Controller must create the participant checkpoints and final control
+candidate seal. During review, every participant commit is immutable and remains its clean
+worktree HEAD; the control candidate remains the authenticated ancestor of the sole dirty
+`verify.md`. The Reviewer checkpoint verifies the candidate's task, role, iteration, participant
+map, vector digest, and snapshot before committing the review record, and rejects any rewrite or
+deletion of a prior review block.
 
 The Reviewer may emit `ACCEPTED` only when all ACs pass with evidence, all required outputs exist,
 all required items are done, the implementation and design agree, scope is respected, and no
@@ -338,7 +422,9 @@ history, physical file line counts, and `git diff --numstat --no-renames`. It mu
 call-graph, schema, execution, peer-validation, or other semantic analysis. A guard is not a
 validator and does not prove quality.
 
-Count only the workspace-relative paths explicitly listed in the proposal's Guard Budgets table.
+Count only the repository-relative paths explicitly listed in the proposal's Guard Budgets table.
+For Protocol v3, every row names `CONTROL` or one registered `REPO-NNN`, and measurement runs
+against that repository's own Base/HEAD.
 The four-pack, required lifecycle edits, and Reviewer evidence do not consume Implementer delivery
 budgets. If initialization declares no task-specific budget, use:
 
@@ -422,14 +508,17 @@ The acceptance snapshot contains:
 - `proposal.md`;
 - `design.md`;
 - `plan.md`;
-- every required deliverable path declared in the standard plan table.
+- every required deliverable path declared in the standard plan table, namespaced by repository.
 
 It excludes `verify.md` to avoid a self-referential hash when the Reviewer appends evidence. Any
 post-review mutation of a snapshot member invalidates acceptance and requires another review.
 
-In Git mode, required repository deliverables must be tracked by the Implementer candidate. The
-snapshot digest remains content-based and does not include Git metadata. Reviewer acceptance binds
-that digest to the full candidate commit through `verify.md` and commit trailers.
+In single-repository Git mode, required repository deliverables must be tracked by the Implementer
+candidate and the legacy content-only snapshot remains unchanged. In Protocol-v3 multi-repository
+mode, the snapshot uses a new schema that includes the canonical participant commit map and
+repo-qualified entries. Every required deliverable must match the blob/tree in its named candidate
+commit. Reviewer acceptance binds the global content digest to the control candidate and full
+candidate-vector digest through `verify.md` and commit trailers.
 
 For project-specific plan formats, pass each deliverable explicitly to `snapshot` with
 `--artifact <path>`.
@@ -444,7 +533,8 @@ Close only from `ACCEPTED`.
 2. Prepare final status fields and links before final acceptance. Prefer root-relative links; when
    final bytes depend on archive depth, stage those exact bytes outside active/archive and review
    the staged candidate before the atomic move.
-3. Ensure deliverables live outside the task directory and remain in place.
+3. Ensure deliverables live outside the task directory, remain in their named repositories, and
+   every participant worktree is clean at its accepted candidate.
 4. Before moving, require the active four-pack and task index in the Reviewer commit and reject an
    ignored archive destination. After the exact archive-ready snapshot is accepted, move all four
    files together without changing their bytes; do not discard failed review history.
@@ -457,9 +547,9 @@ Close only from `ACCEPTED`.
 8. Run `validate --phase archived`.
 9. Create the Closure checkpoint and require it to contain all four active deletions, all four
    archived additions, and the index update; then require a clean loop worktree.
-10. Run the read-only `handoff` gate and return its exact branch, base, candidate, closure commit,
-    snapshot, changed paths, deliverables, Control-event history, and validation evidence to the
-    user.
+10. Run the read-only `handoff` gate and return the exact control branch/Base/candidate/Closure,
+    snapshot, vector digest, and every participant's ID, Base, branch, candidate, changed paths,
+    merge order, deliverables, Control-event history, and validation evidence to the user.
 
 If the move or index update changes an accepted byte or fails integrity checks, roll back to active
 state. Fix and re-review before another archive attempt; never review an already-marked archive as
@@ -474,8 +564,10 @@ bundled `index.md` template. It refuses custom indexes rather than guessing thei
 ## Manual integration boundary
 
 The plugin ends with a manual-merge handoff. It must not create an integration queue or execute
-merge, rebase, cherry-pick, push, branch deletion, or worktree deletion. The user owns integration
-order and conflict resolution.
+merge, rebase, cherry-pick, push, branch deletion, or worktree deletion in any repository. The
+user owns the Planner-declared integration order and conflict resolution. Cross-repository
+candidate creation is ordered and recoverable, not atomic; merging only a subset does not
+integrate the accepted vector.
 
 A clean merge that preserves every accepted snapshot member preserves the branch review evidence,
 but repository-level integration checks should still be run. If conflict resolution or another

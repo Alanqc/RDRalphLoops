@@ -4,7 +4,7 @@
 
 | Field | Value |
 |---|---|
-| Protocol version | 2 |
+| Protocol version | 3 |
 | Run ID | `{{RUN_ID}}` |
 | Worktree root | `{{WORKTREE_ROOT}}` |
 | Branch | `{{GIT_BRANCH}}` |
@@ -20,10 +20,13 @@
 | Planner required next | No |
 | Planner re-entry reason | N/A |
 | Last Reviewer verdict | PENDING |
+| Candidate vector status | PENDING |
 | Consecutive NEEDS_REPLAN | 0 |
 | Completed reviews | 0 |
 | Last Control event | NONE |
 | Last updated | {{DATE}} |
+
+Use `N/A` for Candidate vector status when `design.md` registers no participant repository.
 
 In Git mode, append-only `Ralph-Role: Control` checkpoints are authoritative for pause, resume,
 plan-query, and plan-response events. The summary above may lag while preserved WIP is dirty and is
@@ -35,17 +38,19 @@ refreshed by the next role that may legitimately edit `plan.md`.
 
 ## Deliverables
 
-Paths are relative to the workspace root. Do not encode a temporary worktree's absolute path.
+Paths are relative to the named repository. `CONTROL` is the workspace/control repository;
+`REPO-NNN` refers to the immutable registry in `design.md`. Do not encode participant worktree
+roots in this table.
 
-| ID | Class | ACs | Path | Required | Guard budget | Status | Evidence target |
-|---|---|---|---|---|---|---|---|
-| `DEL-001` | SUBJECT / ASSURANCE / EVIDENCE | `AC-001` | `path/to/output` | Yes | `BUD-001` / EXCLUDED | Pending | [[PLANNER: command, review, or artifact identity]] |
+| ID | Class | ACs | Repository | Path | Required | Guard budget | Status | Evidence target |
+|---|---|---|---|---|---|---|---|---|
+| `DEL-001` | SUBJECT / ASSURANCE / EVIDENCE | `AC-001` | `CONTROL` / `REPO-001` | `path/to/output` | Yes | `BUD-001` / EXCLUDED | Pending | [[PLANNER: command, review, or artifact identity]] |
 
 ## Delivery Items
 
 | Done | ID | Deliverable / ACs | Depends | Owner | Target | Action |
 |---|---|---|---|---|---|---|
-| [ ] | `ITEM-001` | `DEL-001`; `AC-001` | None | Implementer | `path/to/output` | [[PLANNER: one executable action]] |
+| [ ] | `ITEM-001` | `DEL-001`; `AC-001` | None | Implementer | `CONTROL` / `REPO-001`: `path/to/output` | [[PLANNER: one executable action]] |
 
 ## AC Verification Plan
 

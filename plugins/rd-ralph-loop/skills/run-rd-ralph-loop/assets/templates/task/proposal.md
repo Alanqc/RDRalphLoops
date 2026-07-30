@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Protocol version | 2 |
+| Protocol version | 3 |
 | Task ID | `{{TASK_ID}}` |
 | Run ID | `{{RUN_ID}}` |
 | Contract owner | Planner |
@@ -43,9 +43,11 @@ with `BLOCKED` status is not replaceable by simulated or self-generated evidence
 
 ## Guard Budget Defaults
 
-Guard measurements apply only to explicit workspace-relative deliverable paths declared below.
-Line measurement is limited to physical line counts and `git diff --numstat --no-renames`; the
-guard must not add AST, call-graph, schema, execution, or other semantic analysis.
+Guard measurements apply only to explicit repository-relative deliverable paths declared below.
+`CONTROL` names the workspace/control repository; `REPO-NNN` names a participant registered in
+`design.md`. Line measurement is limited to physical line counts and
+`git diff --numstat --no-renames`; the guard must not add AST, call-graph, schema, execution, or
+other semantic analysis.
 
 When no task-specific value is approved during initialization, use these defaults:
 
@@ -62,9 +64,9 @@ paths may be excluded only when the exclusion and reason are explicit. Every dec
 must be covered by a guarded path prefix or a reasoned exclusion. Format exclusions as
 `path :: reason`, separated by semicolons or `<br>`; use `N/A` when none.
 
-| Budget | Profile | Guarded deliverable paths | Warning | Iteration pause | Cumulative pause | Per-path pause | Exclusions | User authorization |
-|---|---|---|---:|---:|---:|---:|---|---|
-| `BUD-001` | CODE / DOCUMENT | `path/to/output` | [[PLANNER: lines or default]] | [[PLANNER: lines or default]] | [[PLANNER: lines or default]] | [[PLANNER: lines or default]] | [[PLANNER: `path :: reason`, or N/A]] | Initial task request / explicit initialization approval |
+| Budget | Repository | Profile | Guarded deliverable paths | Warning | Iteration pause | Cumulative pause | Per-path pause | Exclusions | User authorization |
+|---|---|---|---|---:|---:|---:|---:|---|---|
+| `BUD-001` | `CONTROL` / `REPO-001` | CODE / DOCUMENT | `path/to/output` | [[PLANNER: lines or default]] | [[PLANNER: lines or default]] | [[PLANNER: lines or default]] | [[PLANNER: lines or default]] | [[PLANNER: `path :: reason`, or N/A]] | Initial task request / explicit initialization approval |
 
 ## Acceptance Criteria
 
