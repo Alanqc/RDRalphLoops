@@ -5,22 +5,30 @@ three-role Ralph loop:
 
 ```text
 Planner? -> Implementer -> Reviewer
-                           |
-                           +-- ACCEPTED --------> archive + manual-merge handoff
-                           +-- CHANGES_REQUIRED -> next implementation pass
-                           +-- NEEDS_REPLAN ----> Planner re-entry
-                           `-- BLOCKED ---------> pause with evidence
+               |             |
+               |             +-- ACCEPTED --------> archive + manual-merge handoff
+               |             +-- CHANGES_REQUIRED -> guard -> Implementer or PAUSED
+               |             +-- NEEDS_REPLAN ----> guard -> Planner or PAUSED
+               |             `-- BLOCKED ---------> PAUSED[EXTERNAL]
+               `-- PLAN_FEEDBACK_REQUIRED -> fresh Planner consultation
 ```
 
 The Planner is mandatory during initialization and conditional in later iterations. The
-Implementer and an independent Reviewer are mandatory in every iteration. A loop finishes only
-after the Reviewer accepts the exact candidate.
+Implementer is mandatory in every implementation iteration, and an independent Reviewer is
+mandatory for every immutable candidate. Plan consultation happens before candidate creation. A
+loop finishes only after the Reviewer accepts the exact candidate.
 
 ## What it provides
 
 - A bundled four-document task pack: `proposal.md`, `design.md`, `plan.md`, and `verify.md`.
 - Dedicated Git worktree and `ralph/<task-id>` branch isolation for each loop.
 - Controller-owned, path-scoped checkpoint commits after each role finishes.
+- Typed Reviewer findings that separate subject defects, assurance defects, contract gaps, and
+  external blockers.
+- Simple line-count/`git diff --numstat` budgets for explicitly guarded deliverable paths; the
+  guard does not build semantic validators.
+- Append-only Control events for pause, resume, plan feedback, abandon, and child-task splits while
+  preserving unstaged WIP.
 - Immutable candidate commits and content snapshots for independent review.
 - Evidence-gated acceptance, four-pack archival, retained deliverables, and index updates.
 - A manual-merge handoff. The plugin does not merge, push, rebase, cherry-pick, or delete
@@ -37,7 +45,7 @@ all stored under [`plugins/rd-ralph-loop`](plugins/rd-ralph-loop).
 - Python 3.10 or newer.
 - Git with linked-worktree support.
 
-Version `0.1.0` is validated on macOS and uses a POSIX-oriented test suite. Windows support has not
+Version `0.2.0` is validated on macOS and uses a POSIX-oriented test suite. Windows support has not
 yet been verified. Configure a Git author identity before starting a Git-mode loop.
 
 ## Install
@@ -77,13 +85,16 @@ the resulting branch for me to merge manually:
 
 The main Controller remains available for conversation while a role subagent runs, but role
 dependencies still block lifecycle advancement: Implementer waits for Planner when planning is
-required, and Reviewer waits for the Implementer candidate checkpoint.
+required, and Reviewer waits for the Implementer candidate checkpoint. If Implementer finds the
+plan infeasible, it can request a fresh read-only Planner consultation before creating a candidate.
 
 ## Current limitations
 
 - An active run records its absolute worktree path and should not be moved to another checkout.
 - Automated checkpoint, archive, and handoff validation targets the bundled four-pack schema.
   Repository-specific schemas may require manual lifecycle enforcement.
+- Protocol-v1 review history remains immutable. Legacy runs must append typed findings in new
+  reviews instead of rewriting old blocks.
 - Repository Git hooks, signing rules, attributes, clean filters, and line-ending configuration
   apply normally and can affect checkpoint creation or byte-for-byte snapshot checks.
 
@@ -91,10 +102,10 @@ required, and Reviewer waits for the Implementer candidate checkpoint.
 
 | Actor | Required | May edit | Commits |
 |---|---|---|---|
-| Planner | Initialization; later on replan triggers | Four-pack initially; controlled plan/design changes later | No |
-| Implementer | Every iteration | Declared deliverables, `plan.md`, and necessary `design.md` amendments | No |
-| Reviewer | Every iteration | Append-only `verify.md` evidence and verdict | No |
-| Controller | Entire run | Orchestration and lifecycle state | Creates scoped role checkpoints |
+| Planner | Initialization; later on replan or plan-query triggers | Four-pack initially; controlled plan/design changes later; consultation is read-only over WIP | No |
+| Implementer | Every implementation iteration | Declared deliverables, `plan.md`, and necessary `design.md` amendments | No |
+| Reviewer | Every immutable candidate | Append-only typed `verify.md` evidence and verdict | No |
+| Controller | Entire run | Orchestration and lifecycle state | Creates scoped role and empty Control checkpoints |
 | User | Manual integration | Conflict resolution and final integration | Merges manually |
 
 See the full [skill instructions](plugins/rd-ralph-loop/skills/run-rd-ralph-loop/SKILL.md),
@@ -107,8 +118,10 @@ See the full [skill instructions](plugins/rd-ralph-loop/skills/run-rd-ralph-loop
 python3 plugins/rd-ralph-loop/tests/test_git_flow.py -v
 ```
 
-The test suite exercises checkpoint authority, two-worktree isolation, rejection guards, an
-accepted lifecycle, archival rollback, retained deliverables, and manual-merge handoff behavior.
+The test suite exercises checkpoint authority, two-worktree isolation, typed verdict routing,
+explicit pause/resume transitions, dirty-WIP preservation, line-budget boundaries, Planner
+consultation, legacy compatibility, archival rollback, retained deliverables, and manual-merge
+handoff behavior.
 
 ## Repository layout
 

@@ -57,6 +57,27 @@ def cli(*arguments: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
     return run([sys.executable, str(RALPH), *arguments], expected=expected)
 
 
+def task_cli(
+    command: str,
+    worktree: Path,
+    task_dir: Path,
+    task_id: str,
+    *arguments: str,
+    expected: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    return cli(
+        command,
+        "--workspace-root",
+        str(worktree),
+        "--task-dir",
+        str(task_dir),
+        "--task-id",
+        task_id,
+        *arguments,
+        expected=expected,
+    )
+
+
 def proposal(task_id: str, run_id: str) -> str:
     return f"""# Example Proposal
 
@@ -299,6 +320,161 @@ Every AC passed against the immutable candidate.
 """
 
 
+def proposal_v2(task_id: str, run_id: str) -> str:
+    guard_sections = """## External Dependency Registry
+
+| Dependency | Blocking ACs | Required immutable evidence | Owner | Initial status | Unblock proof |
+|---|---|---|---|---|---|
+| N/A | N/A | N/A | N/A | READY | N/A |
+
+## Guard Budgets
+
+| Budget | Profile | Guarded deliverable paths | Warning | Iteration pause | Cumulative pause | Per-path pause | Exclusions | User authorization |
+|---|---|---|---:|---:|---:|---:|---|---|
+| `BUD-001` | CODE | `output.txt` | 3000 | 5000 | 12000 | 6000 | N/A | Initial task request |
+
+"""
+    return (
+        proposal(task_id, run_id)
+        .replace(
+            "| Task ID |",
+            "| Protocol version | 2 |\n| Task ID |",
+            1,
+        )
+        .replace(
+            "## Acceptance Criteria\n",
+            guard_sections + "## Acceptance Criteria\n",
+            1,
+        )
+    )
+
+
+def design_v2(task_id: str) -> str:
+    return (
+        design(task_id)
+        .replace(
+            "| Deliverable | Path | Format / interface | Owner | ACs | Retention |",
+            "| Deliverable | Class | Path | Format / interface | Owner | ACs | "
+            "Guard budget | Retention |",
+            1,
+        )
+        .replace(
+            "|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|",
+            1,
+        )
+        .replace(
+            f"| `DEL-001` | `output.txt` | UTF-8 text | {task_id} | `AC-001` | Retain |",
+            f"| `DEL-001` | SUBJECT | `output.txt` | UTF-8 text | {task_id} | "
+            "`AC-001` | `BUD-001` | Retain |",
+            1,
+        )
+    )
+
+
+def plan_v2(
+    run_id: str,
+    worktree: Path,
+    branch: str,
+    base: str,
+    *,
+    implemented: bool,
+) -> str:
+    return (
+        plan(
+            run_id,
+            worktree,
+            branch,
+            base,
+            implemented=implemented,
+        )
+        .replace(
+            "| Run ID |",
+            "| Protocol version | 2 |\n| Run ID |",
+            1,
+        )
+        .replace(
+            "| ID | ACs | Path | Required | Status | Evidence target |",
+            "| ID | Class | ACs | Path | Required | Guard budget | Status | "
+            "Evidence target |",
+            1,
+        )
+        .replace(
+            "|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|",
+            1,
+        )
+        .replace(
+            "| `DEL-001` | `AC-001` | `output.txt` | Yes |",
+            "| `DEL-001` | SUBJECT | `AC-001` | `output.txt` | Yes | "
+            "`BUD-001` |",
+            1,
+        )
+    )
+
+
+def typed_verify(
+    run_id: str,
+    candidate: str,
+    branch: str,
+    snapshot: str,
+    *,
+    verdict: str,
+    finding_type: str,
+    action_class: str,
+    ac_result: str,
+    finding_status: str = "Open",
+    evidence: str = "fixture evidence",
+) -> str:
+    return f"""# Example Verify
+
+| Field | Value |
+|---|---|
+| Run ID | `{run_id}` |
+| Evidence owner | Reviewer |
+| Final decision | {verdict} |
+| Accepted snapshot SHA-256 | PENDING |
+| Accepted candidate commit | PENDING |
+
+## Review Ledger
+
+## ITER-001 Review
+
+| Field | Value |
+|---|---|
+| Reviewer | Independent fixture reviewer |
+| Date | 2026-07-30 |
+| Environment | temporary linked worktree, isolated fixture |
+| Candidate commit | `{candidate}` |
+| Candidate branch | `{branch}` |
+| Snapshot SHA-256 | `{snapshot}` |
+| Verdict | {verdict} |
+| Residual risk | Required work remains |
+
+### AC Decision Matrix
+
+| AC | Result | Evidence |
+|---|---|---|
+| AC-001 | {ac_result} | independently observed fixture evidence |
+
+### Findings
+
+| Finding | ACs | Type | Severity | Status | Evidence | Action class | Required action |
+|---|---|---|---|---|---|---|---|
+| F-001 | AC-001 | {finding_type} | P1 | {finding_status} | {evidence} | {action_class} | Perform the bounded required action |
+
+### Commands
+
+| Command / review step | Expected exit | Actual exit | Result | Relevant output |
+|---|---|---|---|---|
+| fixture review | 0 | 1 | FAIL | required condition unavailable |
+
+### Conclusion
+
+The typed finding determines the next lifecycle action.
+"""
+
+
 @contextmanager
 def git_task_fixture(
     task_id: str,
@@ -366,6 +542,33 @@ def git_task_fixture(
         )
         (task_dir / "verify.md").write_text(
             empty_verify(run_id), encoding="utf-8"
+        )
+        yield worktree, task_dir, base
+
+
+@contextmanager
+def git_v2_task_fixture(
+    task_id: str,
+    run_id: str,
+) -> Iterator[tuple[Path, Path, str]]:
+    with git_task_fixture(task_id, run_id) as (worktree, task_dir, base):
+        (task_dir / "proposal.md").write_text(
+            proposal_v2(task_id, run_id),
+            encoding="utf-8",
+        )
+        (task_dir / "design.md").write_text(
+            design_v2(task_id),
+            encoding="utf-8",
+        )
+        (task_dir / "plan.md").write_text(
+            plan_v2(
+                run_id,
+                worktree,
+                f"ralph/{task_id}",
+                base,
+                implemented=False,
+            ),
+            encoding="utf-8",
         )
         yield worktree, task_dir, base
 
@@ -1293,6 +1496,886 @@ class GitFlowTest(unittest.TestCase):
                 expected=2,
             )
             self.assertIn("linked worktree", result.stderr)
+
+
+class ProtocolV2GuardRegressionTest(unittest.TestCase):
+    @staticmethod
+    def _load_ralph_module():
+        import importlib.util
+
+        module_name = "ralph_loop_protocol_v2_regression"
+        spec = importlib.util.spec_from_file_location(module_name, RALPH)
+        if spec is None or spec.loader is None:
+            raise AssertionError(f"cannot import Ralph helper from {RALPH}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _state_entry(
+        role: str,
+        iteration: int,
+        *,
+        commit: str,
+        snapshot: str = "",
+        candidate: str = "",
+        verdict: str = "",
+        control_action: str = "",
+        pause_reasons: tuple[str, ...] = (),
+        resume_role: str = "",
+        authorization: str = "",
+        references: tuple[str, ...] = (),
+        pq_id: str = "",
+        plan_decision: str = "",
+    ) -> dict[str, object]:
+        return {
+            "commit": commit,
+            "role": role,
+            "iteration": iteration,
+            "snapshot": snapshot,
+            "candidate": candidate,
+            "verdict": verdict,
+            "reviewer": "",
+            "control_action": control_action,
+            "pause_reasons": list(pause_reasons),
+            "resume_role": resume_role,
+            "authorization": authorization,
+            "pq_id": pq_id,
+            "plan_decision": plan_decision,
+            "child_task": "",
+            "transferred_paths": [],
+            "references": list(references),
+        }
+
+    def test_blocked_requires_explicit_external_pause_before_planner(self) -> None:
+        task_id = "TASK-V2-BLOCKED"
+        run_id = "RUN-V2-BLOCKED"
+        with git_v2_task_fixture(task_id, run_id) as (
+            worktree,
+            task_dir,
+            base,
+        ):
+            planner_checkpoint(worktree, task_dir, task_id)
+            (worktree / "output.txt").write_text("done\n", encoding="utf-8")
+            (task_dir / "plan.md").write_text(
+                plan_v2(
+                    run_id,
+                    worktree,
+                    f"ralph/{task_id}",
+                    base,
+                    implemented=True,
+                ),
+                encoding="utf-8",
+            )
+            candidate_data = json.loads(
+                task_cli(
+                    "checkpoint",
+                    worktree,
+                    task_dir,
+                    task_id,
+                    "--role",
+                    "implementer",
+                    "--iteration",
+                    "1",
+                ).stdout
+            )
+            candidate = candidate_data["commit"]
+            snapshot = candidate_data["snapshot_sha256"]
+            (task_dir / "verify.md").write_text(
+                typed_verify(
+                    run_id,
+                    candidate,
+                    f"ralph/{task_id}",
+                    snapshot,
+                    verdict="BLOCKED",
+                    finding_type="EXTERNAL_BLOCKER",
+                    action_class="UNBLOCK_EXTERNAL",
+                    ac_result="BLOCKED",
+                ),
+                encoding="utf-8",
+            )
+            reviewer_data = json.loads(
+                task_cli(
+                    "checkpoint",
+                    worktree,
+                    task_dir,
+                    task_id,
+                    "--role",
+                    "reviewer",
+                    "--iteration",
+                    "1",
+                ).stdout
+            )
+            reviewer_head = reviewer_data["commit"]
+
+            guard = json.loads(
+                task_cli(
+                    "guard",
+                    worktree,
+                    task_dir,
+                    task_id,
+                    "--role",
+                    "planner-replan",
+                    expected=1,
+                ).stdout
+            )
+            self.assertEqual(guard["decision"], "PAUSED")
+            self.assertEqual(guard["state"], "AWAITING_PAUSE")
+            self.assertEqual(guard["reasons"], ["EXTERNAL"])
+            self.assertEqual(guard["next_roles"], [])
+
+            (task_dir / "plan.md").write_text(
+                (task_dir / "plan.md").read_text(encoding="utf-8")
+                + """
+
+## Finding Disposition Ledger
+
+| Iteration | Finding | Disposition |
+|---|---|---|
+| 2 | F-001 | DEFER |
+""",
+                encoding="utf-8",
+            )
+            direct_planner = task_cli(
+                "checkpoint",
+                worktree,
+                task_dir,
+                task_id,
+                "--role",
+                "planner-replan",
+                "--iteration",
+                "2",
+                expected=2,
+            )
+            self.assertIn("state is AWAITING_PAUSE", direct_planner.stderr)
+            self.assertEqual(git(worktree, "rev-parse", "HEAD"), reviewer_head)
+
+            paused = json.loads(
+                task_cli(
+                    "control",
+                    worktree,
+                    task_dir,
+                    task_id,
+                    "--action",
+                    "pause",
+                    "--reason",
+                    "EXTERNAL",
+                    "--reference",
+                    "DEP-001 remains unavailable",
+                    "--summary",
+                    f"[{task_id}] pause for external evidence",
+                ).stdout
+            )
+            self.assertEqual(paused["state"], "PAUSED")
+            self.assertEqual(paused["pause_reasons"], ["EXTERNAL"])
+            self.assertEqual(
+                git(worktree, "rev-parse", f"{paused['commit']}^"),
+                reviewer_head,
+            )
+            self.assertEqual(
+                git(
+                    worktree,
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    paused["commit"],
+                ),
+                "",
+            )
+
+    def test_control_empty_commit_preserves_dirty_tracked_and_untracked_wip(
+        self,
+    ) -> None:
+        task_id = "TASK-V2-WIP"
+        run_id = "RUN-V2-WIP"
+        with git_v2_task_fixture(task_id, run_id) as (
+            worktree,
+            task_dir,
+            _,
+        ):
+            planner_checkpoint(worktree, task_dir, task_id)
+            previous_head = git(worktree, "rev-parse", "HEAD")
+            previous_tree = git(worktree, "rev-parse", "HEAD^{tree}")
+            plan_path = task_dir / "plan.md"
+            scratch_path = worktree / "implementer-notes.txt"
+            plan_path.write_text(
+                plan_path.read_text(encoding="utf-8")
+                + "\nImplementer observed an ambiguous plan step.\n",
+                encoding="utf-8",
+            )
+            scratch_path.write_bytes(b"untracked implementation WIP\n")
+            before_status = git(worktree, "status", "--porcelain=v1", "-uall")
+            before_diff = git(worktree, "diff", "--binary")
+            before_plan = plan_path.read_bytes()
+            before_scratch = scratch_path.read_bytes()
+
+            query = json.loads(
+                task_cli(
+                    "control",
+                    worktree,
+                    task_dir,
+                    task_id,
+                    "--action",
+                    "plan-query",
+                    "--pq-id",
+                    "PQ-001",
+                    "--reference",
+                    "ITEM-001",
+                    "--summary",
+                    "Clarify the ambiguous implementation step",
+                ).stdout
+            )
+
+            self.assertTrue(query["wip_preserved"])
+            self.assertEqual(query["state"], "CONSULTING")
+            self.assertNotEqual(query["commit"], previous_head)
+            self.assertEqual(git(worktree, "rev-parse", "HEAD^"), previous_head)
+            self.assertEqual(git(worktree, "rev-parse", "HEAD^{tree}"), previous_tree)
+            self.assertEqual(
+                git(
+                    worktree,
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "HEAD",
+                ),
+                "",
+            )
+            self.assertEqual(
+                git(worktree, "status", "--porcelain=v1", "-uall"),
+                before_status,
+            )
+            self.assertEqual(git(worktree, "diff", "--binary"), before_diff)
+            self.assertEqual(plan_path.read_bytes(), before_plan)
+            self.assertEqual(scratch_path.read_bytes(), before_scratch)
+
+    def test_guard_exact_untracked_boundary_is_read_only_and_budget_is_not_bypassable(
+        self,
+    ) -> None:
+        task_id = "TASK-V2-BUDGET"
+        run_id = "RUN-V2-BUDGET"
+        with git_v2_task_fixture(task_id, run_id) as (
+            worktree,
+            task_dir,
+            _,
+        ):
+            planner_checkpoint(worktree, task_dir, task_id)
+            output = worktree / "output.txt"
+            output.write_text("line\n" * 5000, encoding="utf-8")
+            before_head = git(worktree, "rev-parse", "HEAD")
+            before_tree = git(worktree, "rev-parse", "HEAD^{tree}")
+            before_status = git(worktree, "status", "--porcelain=v1", "-uall")
+            before_bytes = output.read_bytes()
+
+            def budget_guard() -> dict[str, object]:
+                return json.loads(
+                    task_cli(
+                        "guard",
+                        worktree,
+                        task_dir,
+                        task_id,
+                        "--role",
+                        "implementer",
+                        expected=1,
+                    ).stdout
+                )
+
+            first = budget_guard()
+            second = budget_guard()
+            self.assertEqual(first, second)
+            self.assertEqual(first["decision"], "PAUSED")
+            self.assertIn("BUDGET", first["reasons"])
+            self.assertEqual(first["budgets"][0]["iteration_added"], 5000)
+            self.assertEqual(
+                first["mechanism"],
+                "git-diff-numstat-no-renames-plus-untracked-line-count",
+            )
+            self.assertEqual(git(worktree, "rev-parse", "HEAD"), before_head)
+            self.assertEqual(git(worktree, "rev-parse", "HEAD^{tree}"), before_tree)
+            self.assertEqual(
+                git(worktree, "status", "--porcelain=v1", "-uall"),
+                before_status,
+            )
+            self.assertEqual(output.read_bytes(), before_bytes)
+
+            task_cli(
+                "control",
+                worktree,
+                task_dir,
+                task_id,
+                "--action",
+                "pause",
+                "--reason",
+                "BUDGET",
+                "--summary",
+                "Pause at the approved line limit",
+            )
+            task_cli(
+                "control",
+                worktree,
+                task_dir,
+                task_id,
+                "--action",
+                "resume",
+                "--reason",
+                "BUDGET",
+                "--resume-role",
+                "implementer",
+                "--authorization-token",
+                "fixture-user-approval",
+                "--reference",
+                "scope must be contracted under the unchanged budget",
+                "--summary",
+                "Resume only to contract the candidate",
+            )
+            resumed_guard = budget_guard()
+            self.assertEqual(resumed_guard["decision"], "PAUSED")
+            self.assertIn("BUDGET", resumed_guard["reasons"])
+            self.assertEqual(output.read_bytes(), before_bytes)
+
+    def test_clarified_plan_query_returns_to_same_implementer_iteration(
+        self,
+    ) -> None:
+        task_id = "TASK-V2-QUERY"
+        run_id = "RUN-V2-QUERY"
+        with git_v2_task_fixture(task_id, run_id) as (
+            worktree,
+            task_dir,
+            _,
+        ):
+            planner_checkpoint(worktree, task_dir, task_id)
+            task_cli(
+                "control",
+                worktree,
+                task_dir,
+                task_id,
+                "--action",
+                "plan-query",
+                "--pq-id",
+                "PQ-001",
+                "--reference",
+                "ITEM-001",
+                "--summary",
+                "Ask whether exact output includes a newline",
+            )
+            response = json.loads(
+                task_cli(
+                    "control",
+                    worktree,
+                    task_dir,
+                    task_id,
+                    "--action",
+                    "plan-response",
+                    "--pq-id",
+                    "PQ-001",
+                    "--decision",
+                    "CLARIFIED",
+                    "--summary",
+                    "Use one trailing newline",
+                ).stdout
+            )
+            self.assertEqual(response["iteration"], 1)
+            self.assertEqual(response["state"], "ACTIVE")
+
+            guard = json.loads(
+                task_cli(
+                    "guard",
+                    worktree,
+                    task_dir,
+                    task_id,
+                    "--role",
+                    "implementer",
+                ).stdout
+            )
+            self.assertEqual(
+                guard["next_roles"],
+                [{"iteration": 1, "role": "Implementer"}],
+            )
+
+            response_head = git(worktree, "rev-parse", "HEAD")
+            snapshot = json.loads(
+                cli(
+                    "snapshot",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                ).stdout
+            )["snapshot_sha256"]
+            (task_dir / "verify.md").write_text(
+                typed_verify(
+                    run_id,
+                    response_head,
+                    f"ralph/{task_id}",
+                    snapshot,
+                    verdict="CHANGES_REQUIRED",
+                    finding_type="SUBJECT_DEFECT",
+                    action_class="SUBJECT_FIX",
+                    ac_result="FAIL",
+                ),
+                encoding="utf-8",
+            )
+            premature_review = task_cli(
+                "checkpoint",
+                worktree,
+                task_dir,
+                task_id,
+                "--role",
+                "reviewer",
+                "--iteration",
+                "1",
+                expected=2,
+            )
+            self.assertIn(
+                "candidate trailer ralph-role is Control, expected Implementer",
+                premature_review.stderr,
+            )
+            self.assertEqual(git(worktree, "rev-parse", "HEAD"), response_head)
+
+    def test_open_plan_query_cannot_be_resumed_without_planner_response(
+        self,
+    ) -> None:
+        module = self._load_ralph_module()
+        state = module.initial_checkpoint_state()
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry("Planner", 0, commit="planner-0"),
+        )
+        query = self._state_entry(
+            "Control",
+            1,
+            commit="query-1",
+            control_action="PLAN_QUERY",
+            references=("ITEM-001",),
+            pq_id="PQ-001",
+        )
+        module.apply_checkpoint_entry(state, query)
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Control",
+                1,
+                commit="response-1",
+                control_action="PLAN_RESPONSE",
+                pq_id="PQ-001",
+                plan_decision="CLARIFIED",
+            ),
+        )
+        query["commit"] = "query-2"
+        query["pq_id"] = "PQ-002"
+        module.apply_checkpoint_entry(state, query)
+        self.assertEqual(state["status"], "PAUSED")
+        self.assertEqual(state["pending_query"], "PQ-002")
+
+        with self.assertRaisesRegex(module.RalphError, "cannot bypass an open plan query"):
+            module.apply_checkpoint_entry(
+                state,
+                self._state_entry(
+                    "Control",
+                    1,
+                    commit="resume-1",
+                    control_action="RESUME",
+                    pause_reasons=("PLAN_CONFLICT",),
+                    resume_role="Implementer",
+                    authorization="a" * 64,
+                    references=("planner response still required",),
+                ),
+            )
+
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Control",
+                1,
+                commit="response-2",
+                control_action="PLAN_RESPONSE",
+                pq_id="PQ-002",
+                plan_decision="CLARIFIED",
+            ),
+        )
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Control",
+                1,
+                commit="resume-2",
+                control_action="RESUME",
+                pause_reasons=("PLAN_CONFLICT",),
+                resume_role="Implementer",
+                authorization="a" * 64,
+                references=("PQ-002 clarified",),
+            ),
+        )
+        self.assertEqual(state["expected"], {("Implementer", 1)})
+
+    def test_replan_requires_a_disposition_for_each_open_finding(self) -> None:
+        module = self._load_ralph_module()
+        verify = typed_verify(
+            "RUN-DISPOSITION",
+            "0" * 40,
+            "ralph/TASK-DISPOSITION",
+            "0" * 64,
+            verdict="NEEDS_REPLAN",
+            finding_type="CONTRACT_GAP",
+            action_class="REPLAN",
+            ac_result="FAIL",
+        )
+        missing = module.replan_disposition_errors(
+            "## Finding Disposition Ledger\n\n"
+            "| Iteration | Finding | Disposition |\n"
+            "|---|---|---|\n",
+            verify,
+            2,
+        )
+        self.assertIn(
+            "planner replan has no disposition for open findings: F-001",
+            missing,
+        )
+        complete = module.replan_disposition_errors(
+            "## Finding Disposition Ledger\n\n"
+            "| Iteration | Finding | Disposition |\n"
+            "|---|---|---|\n"
+            "| 2 | F-001 | FIX |\n",
+            verify,
+            2,
+        )
+        self.assertEqual(complete, [])
+
+    def test_typed_finding_verdict_truth_table(self) -> None:
+        task_id = "TASK-V2-FINDINGS"
+        run_id = "RUN-V2-FINDINGS"
+        with git_v2_task_fixture(task_id, run_id) as (
+            worktree,
+            task_dir,
+            _,
+        ):
+            planner_checkpoint(worktree, task_dir, task_id)
+
+            def validate_case(
+                *,
+                verdict: str,
+                finding_type: str,
+                action_class: str,
+                expected: int,
+            ) -> subprocess.CompletedProcess[str]:
+                (task_dir / "verify.md").write_text(
+                    typed_verify(
+                        run_id,
+                        "0" * 40,
+                        f"ralph/{task_id}",
+                        "0" * 64,
+                        verdict=verdict,
+                        finding_type=finding_type,
+                        action_class=action_class,
+                        ac_result="BLOCKED" if verdict == "BLOCKED" else "FAIL",
+                    ),
+                    encoding="utf-8",
+                )
+                return cli(
+                    "validate",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                    "--phase",
+                    "planned",
+                    expected=expected,
+                )
+
+            invalid_external = json.loads(
+                validate_case(
+                    verdict="CHANGES_REQUIRED",
+                    finding_type="EXTERNAL_BLOCKER",
+                    action_class="UNBLOCK_EXTERNAL",
+                    expected=1,
+                ).stdout
+            )
+            self.assertIn(
+                "ITER-001 has open EXTERNAL_BLOCKER findings, so Verdict must be BLOCKED",
+                invalid_external["errors"],
+            )
+            valid_external = json.loads(
+                validate_case(
+                    verdict="BLOCKED",
+                    finding_type="EXTERNAL_BLOCKER",
+                    action_class="UNBLOCK_EXTERNAL",
+                    expected=0,
+                ).stdout
+            )
+            self.assertTrue(valid_external["valid"])
+
+            invalid_replan = json.loads(
+                validate_case(
+                    verdict="NEEDS_REPLAN",
+                    finding_type="SUBJECT_DEFECT",
+                    action_class="SUBJECT_FIX",
+                    expected=1,
+                ).stdout
+            )
+            self.assertIn(
+                "ITER-001 NEEDS_REPLAN requires an open CONTRACT_GAP with REPLAN",
+                invalid_replan["errors"],
+            )
+            valid_replan = json.loads(
+                validate_case(
+                    verdict="NEEDS_REPLAN",
+                    finding_type="CONTRACT_GAP",
+                    action_class="REPLAN",
+                    expected=0,
+                ).stdout
+            )
+            self.assertTrue(valid_replan["valid"])
+
+            invalid_open_close = (task_dir / "verify.md").read_text(
+                encoding="utf-8"
+            ).replace(
+                "| F-001 | AC-001 | CONTRACT_GAP | P1 | Open | "
+                "fixture evidence | REPLAN |",
+                "| F-001 | AC-001 | CONTRACT_GAP | P1 | Open | "
+                "fixture evidence | CLOSE |",
+            )
+            (task_dir / "verify.md").write_text(
+                invalid_open_close,
+                encoding="utf-8",
+            )
+            status_result = json.loads(
+                cli(
+                    "validate",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                    "--phase",
+                    "planned",
+                    expected=1,
+                ).stdout
+            )
+            self.assertIn(
+                "ITER-001 F-001 OPEN finding must not use CLOSE",
+                status_result["errors"],
+            )
+
+    def test_resume_override_survives_until_the_next_reviewer(self) -> None:
+        module = self._load_ralph_module()
+        state = module.initial_checkpoint_state()
+        snapshot_1 = "1" * 64
+        snapshot_2 = "2" * 64
+        planner_0 = self._state_entry(
+            "Planner",
+            0,
+            commit="planner-0",
+        )
+        implementer_1 = self._state_entry(
+            "Implementer",
+            1,
+            commit="implementer-1",
+            snapshot=snapshot_1,
+        )
+        reviewer_1 = self._state_entry(
+            "Reviewer",
+            1,
+            commit="reviewer-1",
+            snapshot=snapshot_1,
+            candidate="implementer-1",
+            verdict="CHANGES_REQUIRED",
+        )
+        for entry in (planner_0, implementer_1, reviewer_1):
+            module.apply_checkpoint_entry(state, entry)
+
+        reasons = ("ASSURANCE", "REPLAN_STORM", "USER_CHECKPOINT")
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Control",
+                1,
+                commit="pause-1",
+                control_action="PAUSE",
+                pause_reasons=reasons,
+            ),
+        )
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Control",
+                2,
+                commit="resume-2",
+                control_action="RESUME",
+                pause_reasons=reasons,
+                resume_role="Planner",
+                authorization="a" * 64,
+                references=("user approval",),
+            ),
+        )
+        self.assertTrue(state["resume_grant"])
+        self.assertEqual(state["resume_override"], set(reasons))
+
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Planner",
+                2,
+                commit="planner-2",
+            ),
+        )
+        self.assertTrue(state["resume_grant"])
+        self.assertEqual(state["resume_override"], set(reasons))
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Implementer",
+                2,
+                commit="implementer-2",
+                snapshot=snapshot_2,
+            ),
+        )
+        self.assertTrue(state["resume_grant"])
+        self.assertEqual(state["resume_override"], set(reasons))
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Reviewer",
+                2,
+                commit="reviewer-2",
+                snapshot=snapshot_2,
+                candidate="implementer-2",
+                verdict="CHANGES_REQUIRED",
+            ),
+        )
+        self.assertFalse(state["resume_grant"])
+        self.assertEqual(state["resume_override"], set())
+
+    def test_planner_only_pause_recovery_and_episode_reason_intersection(
+        self,
+    ) -> None:
+        import copy
+
+        module = self._load_ralph_module()
+
+        def state_waiting_for_implementer() -> dict[str, object]:
+            state = module.initial_checkpoint_state()
+            module.apply_checkpoint_entry(
+                state,
+                self._state_entry(
+                    "Planner",
+                    0,
+                    commit="planner-0",
+                ),
+            )
+            return state
+
+        for reason in ("CONFIGURATION_GAP", "SCHEMA_MIGRATION"):
+            with self.subTest(reason=reason):
+                state = state_waiting_for_implementer()
+                module.apply_checkpoint_entry(
+                    state,
+                    self._state_entry(
+                        "Control",
+                        0,
+                        commit=f"pause-{reason}",
+                        control_action="PAUSE",
+                        pause_reasons=(reason,),
+                    ),
+                )
+                self.assertEqual(
+                    state["suspended_expected"],
+                    {("Implementer", 1), ("Planner", 1)},
+                )
+                module.apply_checkpoint_entry(
+                    state,
+                    self._state_entry(
+                        "Control",
+                        1,
+                        commit=f"resume-{reason}",
+                        control_action="RESUME",
+                        pause_reasons=(reason,),
+                        resume_role="Planner",
+                        authorization="a" * 64,
+                        references=("repair evidence",),
+                    ),
+                )
+                self.assertEqual(state["status"], "ACTIVE")
+                self.assertEqual(state["expected"], {("Planner", 1)})
+
+        state = state_waiting_for_implementer()
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Control",
+                0,
+                commit="pause-configuration",
+                control_action="PAUSE",
+                pause_reasons=("CONFIGURATION_GAP",),
+            ),
+        )
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Control",
+                0,
+                commit="pause-budget",
+                control_action="PAUSE",
+                pause_reasons=("BUDGET",),
+            ),
+        )
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Control",
+                1,
+                commit="partial-resume",
+                control_action="RESUME",
+                pause_reasons=("CONFIGURATION_GAP",),
+                resume_role="Planner",
+                authorization="a" * 64,
+                references=("configuration repaired",),
+            ),
+        )
+        self.assertEqual(state["status"], "PAUSED")
+        self.assertEqual(state["pause_reasons"], {"BUDGET"})
+        self.assertEqual(
+            state["pause_episode_reasons"],
+            {"CONFIGURATION_GAP", "BUDGET"},
+        )
+
+        invalid_role_state = copy.deepcopy(state)
+        with self.assertRaisesRegex(
+            module.RalphError,
+            "RESUME role Implementer is not legal for BUDGET, CONFIGURATION_GAP",
+        ):
+            module.apply_checkpoint_entry(
+                invalid_role_state,
+                self._state_entry(
+                    "Control",
+                    1,
+                    commit="invalid-final-resume",
+                    control_action="RESUME",
+                    pause_reasons=("BUDGET",),
+                    resume_role="Implementer",
+                    authorization="a" * 64,
+                    references=("budget disposition",),
+                ),
+            )
+        module.apply_checkpoint_entry(
+            state,
+            self._state_entry(
+                "Control",
+                1,
+                commit="valid-final-resume",
+                control_action="RESUME",
+                pause_reasons=("BUDGET",),
+                resume_role="Planner",
+                authorization="a" * 64,
+                references=("budget disposition",),
+            ),
+        )
+        self.assertEqual(state["status"], "ACTIVE")
+        self.assertEqual(state["expected"], {("Planner", 1)})
+        self.assertEqual(
+            state["resume_override"],
+            {"CONFIGURATION_GAP", "BUDGET"},
+        )
 
 
 class ArchiveTransactionRegressionTest(unittest.TestCase):

@@ -1,21 +1,23 @@
 {
   "name": "rd-ralph-loop",
-  "version": "0.1.0",
-  "description": "Isolated, checkpointed three-role Ralph loops with manual Git integration.",
+  "version": "0.2.0",
+  "description": "Evidence-gated Ralph loops with auditable pause controls and complexity guards.",
   "author": {
     "name": "Alanqc"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "R&D Ralph Loop",
-    "shortDescription": "Run isolated, checkpointed R&D loops.",
-    "longDescription": "Run interactive Planner, Implementer, and Reviewer loops in dedicated Git worktrees with scoped checkpoint commits, evidence-gated archival, and a user-controlled manual-merge handoff.",
+    "shortDescription": "Run guarded, checkpointed R&D loops.",
+    "longDescription": "Run interactive Planner, Implementer, and Reviewer loops in dedicated Git worktrees with typed findings, bounded implementation growth, auditable pause and resume controls, evidence-gated archival, and a user-controlled manual-merge handoff.",
     "developerName": "Alanqc",
     "category": "Productivity",
     "capabilities": [
       "Multi-agent orchestration",
       "Git worktree isolation",
       "Scoped checkpoint commits",
+      "Complexity circuit breakers",
+      "Auditable pause and resume",
       "Write",
       "Review"
     ],

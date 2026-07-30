@@ -21,6 +21,76 @@ from urllib.parse import quote
 FOUR_PACK = ("proposal.md", "design.md", "plan.md", "verify.md")
 SNAPSHOT_DOCS = ("proposal.md", "design.md", "plan.md")
 VERDICTS = {"ACCEPTED", "CHANGES_REQUIRED", "NEEDS_REPLAN", "BLOCKED"}
+FINDING_TYPES = {
+    "SUBJECT_DEFECT",
+    "ASSURANCE_DEFECT",
+    "CONTRACT_GAP",
+    "EXTERNAL_BLOCKER",
+}
+FINDING_ACTIONS = {
+    "SUBJECT_FIX",
+    "SHRINK_ASSURANCE",
+    "DIRECT_RECOMPUTE",
+    "MINIMAL_LOCAL_FIX",
+    "REPLAN",
+    "UNBLOCK_EXTERNAL",
+    "ESCALATE",
+    "CLOSE",
+}
+ASSURANCE_ACTIONS = {
+    "SHRINK_ASSURANCE",
+    "DIRECT_RECOMPUTE",
+    "MINIMAL_LOCAL_FIX",
+    "ESCALATE",
+}
+PAUSE_REASONS = {
+    "EXTERNAL",
+    "BUDGET",
+    "ASSURANCE",
+    "REPLAN_STORM",
+    "USER_CHECKPOINT",
+    "PLAN_CONFLICT",
+    "CONFIGURATION_GAP",
+    "SCHEMA_MIGRATION",
+}
+PAUSE_RESUME_ROLES = {
+    "EXTERNAL": {"Planner", "Implementer"},
+    "BUDGET": {"Planner", "Implementer"},
+    "ASSURANCE": {"Planner", "Implementer"},
+    "REPLAN_STORM": {"Planner"},
+    "USER_CHECKPOINT": {"Planner", "Implementer"},
+    "PLAN_CONFLICT": {"Planner", "Implementer"},
+    "CONFIGURATION_GAP": {"Planner"},
+    "SCHEMA_MIGRATION": {"Planner"},
+}
+CONTROL_ACTIONS = {
+    "PAUSE",
+    "RESUME",
+    "PLAN_QUERY",
+    "PLAN_RESPONSE",
+    "ABANDON",
+    "SPLIT",
+}
+PLAN_RESPONSE_DECISIONS = {
+    "CLARIFIED",
+    "REPLAN_REQUIRED",
+    "CONTRACT_CHANGE_REQUIRED",
+    "EXTERNAL_BLOCKER",
+}
+GUARD_DEFAULTS = {
+    "CODE": {
+        "warning": 3000,
+        "iteration_pause": 5000,
+        "cumulative_pause": 12000,
+        "per_path_pause": 6000,
+    },
+    "DOCUMENT": {
+        "warning": 10000,
+        "iteration_pause": 20000,
+        "cumulative_pause": 50000,
+        "per_path_pause": 30000,
+    },
+}
 REVIEW_PLACEHOLDERS = {
     "reviewer identity",
     "repo, cwd, branch/commit, dependencies",
@@ -121,6 +191,7 @@ def run_git(
             check=False,
             capture_output=True,
             text=True,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
     except OSError as exc:
         raise RalphError(f"cannot run git: {exc}") from exc
@@ -141,6 +212,7 @@ def run_git_bytes(
             ["git", "-C", str(workspace_root), *arguments],
             check=False,
             capture_output=True,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
     except OSError as exc:
         raise RalphError(f"cannot run git: {exc}") from exc
@@ -504,6 +576,344 @@ def assert_files_trackable_for_checkpoint(
         )
 
 
+def trailer_list(raw: str) -> list[str]:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RalphError(f"invalid JSON list trailer: {raw}") from exc
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise RalphError(f"invalid JSON list trailer: {raw}")
+    return value
+
+
+def initial_checkpoint_state() -> dict[str, object]:
+    return {
+        "status": "ACTIVE",
+        "expected": {("Planner", 0)},
+        "suspended_expected": set(),
+        "pause_reasons": set(),
+        "pause_episode_reasons": set(),
+        "required_pause_reasons": set(),
+        "resume_override": set(),
+        "resume_grant": False,
+        "resolved_external": False,
+        "pending_query": "",
+        "query_counts": {},
+        "last_substantive": None,
+    }
+
+
+def apply_checkpoint_entry(
+    state: dict[str, object],
+    entry: dict[str, object],
+) -> None:
+    role = str(entry["role"])
+    iteration = int(entry["iteration"])
+    expected = state["expected"]
+    assert isinstance(expected, set)
+    if role != "Control":
+        if state["status"] != "ACTIVE" or (role, iteration) not in expected:
+            wanted = ", ".join(
+                f"{item_role} iteration {item_iteration}"
+                for item_role, item_iteration in sorted(expected)
+            ) or "no role checkpoint"
+            raise RalphError(
+                f"invalid Ralph checkpoint sequence: found {role} iteration "
+                f"{iteration}; expected {wanted} while state is {state['status']}"
+            )
+        previous = state["last_substantive"]
+        if role == "Reviewer":
+            if not isinstance(previous, dict) or previous["role"] != "Implementer":
+                raise RalphError("Reviewer must immediately follow an Implementer candidate")
+            if entry["candidate"] != previous["commit"]:
+                raise RalphError(
+                    f"Reviewer checkpoint {entry['commit']} is not bound to its "
+                    "immediately preceding Implementer"
+                )
+            if entry["snapshot"] != previous["snapshot"]:
+                raise RalphError(
+                    f"Reviewer checkpoint {entry['commit']} snapshot differs from "
+                    "its Implementer candidate"
+                )
+        if role == "Closure":
+            if not isinstance(previous, dict) or previous["role"] != "Reviewer":
+                raise RalphError("Closure must immediately follow an accepted Reviewer")
+            if entry["reviewer"] != previous["commit"]:
+                raise RalphError(
+                    f"Closure checkpoint {entry['commit']} is not bound to its "
+                    "immediately preceding Reviewer"
+                )
+            if (
+                entry["candidate"] != previous["candidate"]
+                or entry["snapshot"] != previous["snapshot"]
+                or entry["verdict"] != previous["verdict"]
+            ):
+                raise RalphError(
+                    f"Closure checkpoint {entry['commit']} does not preserve the "
+                    "Reviewer acceptance binding"
+                )
+        if role in {"Reviewer", "Closure"}:
+            state["resume_grant"] = False
+            state["resume_override"] = set()
+            state["pause_episode_reasons"] = set()
+        state["last_substantive"] = entry
+        state["suspended_expected"] = set()
+        if role == "Planner":
+            state["expected"] = {
+                ("Implementer", 1 if iteration == 0 else iteration)
+            }
+        elif role == "Implementer":
+            state["expected"] = {("Reviewer", iteration)}
+        elif role == "Reviewer":
+            verdict = str(entry["verdict"])
+            if verdict == "ACCEPTED":
+                state["expected"] = {("Closure", iteration)}
+            elif verdict == "BLOCKED":
+                state["resolved_external"] = False
+                state["status"] = "AWAITING_PAUSE"
+                state["pause_reasons"] = set()
+                state["required_pause_reasons"] = {"EXTERNAL"}
+                state["expected"] = set()
+                state["suspended_expected"] = {
+                    ("Planner", iteration + 1),
+                    ("Implementer", iteration + 1),
+                }
+            elif verdict == "NEEDS_REPLAN":
+                state["expected"] = {("Planner", iteration + 1)}
+            else:
+                state["expected"] = {
+                    ("Planner", iteration + 1),
+                    ("Implementer", iteration + 1),
+                }
+        else:
+            state["status"] = "CLOSED"
+            state["expected"] = set()
+        return
+
+    if state["status"] in {"CLOSED", "ABANDONED"}:
+        raise RalphError(f"{state['status']} is terminal; no Control event is allowed")
+    action = str(entry["control_action"])
+    reasons = set(entry["pause_reasons"])
+    if action not in CONTROL_ACTIONS:
+        raise RalphError(
+            f"Control checkpoint {entry['commit']} has invalid action "
+            f"{action or 'missing'}"
+        )
+    if reasons - PAUSE_REASONS:
+        raise RalphError(
+            "Control checkpoint has invalid pause reasons: "
+            + ", ".join(sorted(reasons - PAUSE_REASONS))
+        )
+    if action == "PAUSE":
+        if not reasons:
+            raise RalphError("PAUSE requires at least one reason")
+        if state["status"] == "ACTIVE" and any(
+            target_role == "Closure" for target_role, _ in expected
+        ):
+            raise RalphError(
+                "an ACCEPTED review may only close or be explicitly abandoned"
+            )
+        if "EXTERNAL" in reasons and not entry["references"]:
+            raise RalphError("PAUSE(EXTERNAL) requires an evidence --reference")
+        required_reasons = set(state["required_pause_reasons"])
+        if not required_reasons.issubset(reasons):
+            raise RalphError(
+                "PAUSE must include required reasons: "
+                + ", ".join(sorted(required_reasons))
+            )
+        already_paused = state["status"] == "PAUSED"
+        if not already_paused:
+            if not state["suspended_expected"]:
+                state["suspended_expected"] = set(expected)
+            state["pause_episode_reasons"] = set()
+        state["pause_episode_reasons"] = (
+            set(state["pause_episode_reasons"]) | reasons
+        )
+        suspended = state["suspended_expected"]
+        assert isinstance(suspended, set)
+        if reasons & {
+            "EXTERNAL",
+            "BUDGET",
+            "ASSURANCE",
+            "USER_CHECKPOINT",
+            "CONFIGURATION_GAP",
+            "SCHEMA_MIGRATION",
+        }:
+            recovery_sources = [
+                (target_role, target_iteration)
+                for target_role, target_iteration in list(suspended or expected)
+                if target_role in {"Planner", "Implementer"}
+            ]
+            suspended.update(
+                ("Planner", target_iteration)
+                for _, target_iteration in recovery_sources
+            )
+        state["status"] = "PAUSED"
+        state["resume_grant"] = False
+        state["resume_override"] = set()
+        if "EXTERNAL" in reasons:
+            state["resolved_external"] = False
+        state["pause_reasons"] = set(state["pause_reasons"]) | reasons
+        state["required_pause_reasons"] = set()
+        state["expected"] = set()
+    elif action == "RESUME":
+        if state["status"] != "PAUSED":
+            raise RalphError("RESUME requires a PAUSED task")
+        if state["pending_query"]:
+            raise RalphError(
+                "RESUME cannot bypass an open plan query; record PLAN_RESPONSE "
+                "or explicitly split/abandon"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", str(entry["authorization"])):
+            raise RalphError("RESUME requires an audited user authorization")
+        if not entry["references"]:
+            raise RalphError("RESUME requires a resolution-evidence --reference")
+        active_reasons = set(state["pause_reasons"])
+        if not reasons or not reasons.issubset(active_reasons):
+            raise RalphError(
+                "RESUME reasons must be a non-empty subset of active pause reasons"
+            )
+        remaining = active_reasons - reasons
+        if "EXTERNAL" in reasons:
+            state["resolved_external"] = True
+        state["pause_reasons"] = remaining
+        if not remaining:
+            resume_role = str(entry["resume_role"])
+            target = (resume_role, iteration)
+            episode_reasons = set(state["pause_episode_reasons"])
+            allowed_roles = {"Planner", "Implementer"}
+            for reason in episode_reasons:
+                allowed_roles &= PAUSE_RESUME_ROLES[reason]
+            if resume_role not in allowed_roles:
+                raise RalphError(
+                    f"RESUME role {resume_role or 'missing'} is not legal for "
+                    + ", ".join(sorted(episode_reasons))
+                )
+            suspended = state["suspended_expected"]
+            assert isinstance(suspended, set)
+            if target not in suspended:
+                wanted = ", ".join(
+                    f"{item_role} iteration {item_iteration}"
+                    for item_role, item_iteration in sorted(suspended)
+                ) or "no legal resume target"
+                raise RalphError(
+                    f"RESUME target {resume_role} iteration {iteration} is invalid; "
+                    f"expected {wanted}"
+                )
+            state["status"] = "ACTIVE"
+            state["expected"] = {target}
+            state["resume_override"] = episode_reasons
+            state["resume_grant"] = True
+            state["pause_episode_reasons"] = set()
+    elif action == "PLAN_QUERY":
+        if state["status"] != "ACTIVE" or state["pending_query"]:
+            raise RalphError("PLAN_QUERY requires active Implementer work and no open query")
+        implementer_targets = [
+            target for target in expected if target[0] == "Implementer"
+        ]
+        if len(implementer_targets) != 1 or implementer_targets[0][1] != iteration:
+            raise RalphError("PLAN_QUERY is only legal before an Implementer candidate")
+        query_id = str(entry["pq_id"])
+        if not re.fullmatch(r"PQ-\d{3,}", query_id):
+            raise RalphError("PLAN_QUERY requires a PQ-NNN identifier")
+        if not any(
+            re.fullmatch(r"(?:ITEM|DEL|AC)-\d{3,}", value.upper())
+            for value in entry["references"]
+        ):
+            raise RalphError("PLAN_QUERY requires at least one ITEM/DEL/AC --reference")
+        counts = state["query_counts"]
+        assert isinstance(counts, dict)
+        counts[iteration] = int(counts.get(iteration, 0)) + 1
+        state["pending_query"] = query_id
+        state["expected"] = set()
+        state["suspended_expected"] = {("Implementer", iteration)}
+        if counts[iteration] >= 2:
+            state["status"] = "PAUSED"
+            state["resume_grant"] = False
+            state["resume_override"] = set()
+            state["pause_reasons"] = set(state["pause_reasons"]) | {"PLAN_CONFLICT"}
+            state["pause_episode_reasons"] = (
+                set(state["pause_episode_reasons"]) | {"PLAN_CONFLICT"}
+            )
+        else:
+            state["status"] = "CONSULTING"
+    elif action == "PLAN_RESPONSE":
+        if str(entry["pq_id"]) != state["pending_query"]:
+            raise RalphError("PLAN_RESPONSE must resolve the currently open PQ-NNN")
+        decision = str(entry["plan_decision"])
+        if decision not in PLAN_RESPONSE_DECISIONS:
+            raise RalphError(
+                f"PLAN_RESPONSE has invalid decision {decision or 'missing'}"
+            )
+        if decision == "EXTERNAL_BLOCKER" and not entry["references"]:
+            raise RalphError(
+                "PLAN_RESPONSE(EXTERNAL_BLOCKER) requires a dependency/evidence --reference"
+            )
+        state["pending_query"] = ""
+        if decision == "CLARIFIED" and state["status"] != "PAUSED":
+            state["status"] = "ACTIVE"
+            state["expected"] = {("Implementer", iteration)}
+            state["suspended_expected"] = set()
+        else:
+            reason = {
+                "REPLAN_REQUIRED": "PLAN_CONFLICT",
+                "CONTRACT_CHANGE_REQUIRED": "USER_CHECKPOINT",
+                "EXTERNAL_BLOCKER": "EXTERNAL",
+                "CLARIFIED": "PLAN_CONFLICT",
+            }[decision]
+            state["status"] = "PAUSED"
+            state["resume_grant"] = False
+            state["resume_override"] = set()
+            if reason == "EXTERNAL":
+                state["resolved_external"] = False
+            state["pause_reasons"] = set(state["pause_reasons"]) | {reason}
+            state["pause_episode_reasons"] = (
+                set(state["pause_episode_reasons"]) | {reason}
+            )
+            state["expected"] = set()
+            state["suspended_expected"] = (
+                {("Planner", iteration)}
+                if decision in {"REPLAN_REQUIRED", "CONTRACT_CHANGE_REQUIRED"}
+                else {("Planner", iteration), ("Implementer", iteration)}
+            )
+    elif action == "ABANDON":
+        if not re.fullmatch(r"[0-9a-f]{64}", str(entry["authorization"])):
+            raise RalphError("ABANDON requires an audited user authorization")
+        state["status"] = "ABANDONED"
+        state["resume_grant"] = False
+        state["resume_override"] = set()
+        state["expected"] = set()
+        state["pause_reasons"] = set()
+        state["pause_episode_reasons"] = set()
+    else:
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", str(entry["authorization"]))
+            or not entry["child_task"]
+        ):
+            raise RalphError("SPLIT requires user authorization and a child task ID")
+        if not entry["transferred_paths"]:
+            raise RalphError("SPLIT requires at least one transferred path")
+        if state["status"] != "PAUSED":
+            state["suspended_expected"] = set(expected)
+        state["status"] = "PAUSED"
+        state["resume_grant"] = False
+        state["resume_override"] = set()
+        state["pause_reasons"] = set(state["pause_reasons"]) | {"USER_CHECKPOINT"}
+        state["pause_episode_reasons"] = (
+            set(state["pause_episode_reasons"]) | {"USER_CHECKPOINT"}
+        )
+        state["expected"] = set()
+
+
+def replay_checkpoint_chain(chain: list[dict[str, object]]) -> dict[str, object]:
+    state = initial_checkpoint_state()
+    for entry in chain:
+        apply_checkpoint_entry(state, entry)
+    return state
+
+
 def task_commit_chain(
     workspace_root: Path,
     task_id: str,
@@ -580,7 +990,7 @@ def task_commit_chain(
             )
 
     chain: list[dict[str, object]] = []
-    allowed_roles = {"Planner", "Implementer", "Reviewer", "Closure"}
+    allowed_roles = {"Planner", "Implementer", "Reviewer", "Closure", "Control"}
     for commit in commits:
         trailers = commit_trailers(workspace_root, commit)
         commit_task = trailers.get("ralph-task", "")
@@ -605,6 +1015,7 @@ def task_commit_chain(
         candidate = trailers.get("ralph-candidate", "").lower()
         verdict = trailers.get("ralph-verdict", "").upper()
         reviewer = trailers.get("ralph-reviewer", "").lower()
+        control_action = trailers.get("ralph-control-action", "").upper()
         if role in {"Implementer", "Reviewer", "Closure"} and not re.fullmatch(
             r"[0-9a-f]{64}", snapshot
         ):
@@ -634,6 +1045,25 @@ def task_commit_chain(
                 "candidate": candidate,
                 "verdict": verdict,
                 "reviewer": reviewer,
+                "control_action": control_action,
+                "pause_reasons": trailer_list(
+                    trailers.get("ralph-pause-reasons", "")
+                ),
+                "resume_role": trailers.get("ralph-resume-role", "").title(),
+                "authorization": trailers.get(
+                    "ralph-authorization-sha256", ""
+                ).lower(),
+                "pq_id": trailers.get("ralph-plan-query", "").upper(),
+                "plan_decision": trailers.get(
+                    "ralph-plan-decision", ""
+                ).upper(),
+                "child_task": trailers.get("ralph-child-task", ""),
+                "transferred_paths": trailer_list(
+                    trailers.get("ralph-transferred-paths", "")
+                ),
+                "references": trailer_list(
+                    trailers.get("ralph-references", "")
+                ),
             }
         )
 
@@ -662,69 +1092,7 @@ def task_commit_chain(
             f"expected {authoritative_base}"
         )
 
-    for previous, current in zip(chain, chain[1:]):
-        previous_role = str(previous["role"])
-        current_role = str(current["role"])
-        previous_iteration = int(previous["iteration"])
-        current_iteration = int(current["iteration"])
-        allowed: set[tuple[str, int]]
-        if previous_role == "Planner":
-            allowed = {
-                (
-                    "Implementer",
-                    1 if previous_iteration == 0 else previous_iteration,
-                )
-            }
-        elif previous_role == "Implementer":
-            allowed = {("Reviewer", previous_iteration)}
-        elif previous_role == "Reviewer":
-            if previous["verdict"] == "ACCEPTED":
-                allowed = {("Closure", previous_iteration)}
-            elif previous["verdict"] in {"NEEDS_REPLAN", "BLOCKED"}:
-                allowed = {("Planner", previous_iteration + 1)}
-            else:
-                allowed = {
-                    ("Planner", previous_iteration + 1),
-                    ("Implementer", previous_iteration + 1),
-                }
-        else:
-            allowed = set()
-        if (current_role, current_iteration) not in allowed:
-            expected = ", ".join(
-                f"{role} iteration {iteration}"
-                for role, iteration in sorted(allowed)
-            ) or "no further checkpoint"
-            raise RalphError(
-                f"invalid Ralph checkpoint sequence after {previous_role} "
-                f"iteration {previous_iteration}: found {current_role} iteration "
-                f"{current_iteration}; expected {expected}"
-            )
-        if current_role == "Reviewer":
-            if current["candidate"] != previous["commit"]:
-                raise RalphError(
-                    f"Reviewer checkpoint {current['commit']} is not bound to its "
-                    "immediately preceding Implementer"
-                )
-            if current["snapshot"] != previous["snapshot"]:
-                raise RalphError(
-                    f"Reviewer checkpoint {current['commit']} snapshot differs from "
-                    "its Implementer candidate"
-                )
-        if current_role == "Closure":
-            if current["reviewer"] != previous["commit"]:
-                raise RalphError(
-                    f"Closure checkpoint {current['commit']} is not bound to its "
-                    "immediately preceding Reviewer"
-                )
-            if (
-                current["candidate"] != previous["candidate"]
-                or current["snapshot"] != previous["snapshot"]
-                or current["verdict"] != previous["verdict"]
-            ):
-                raise RalphError(
-                    f"Closure checkpoint {current['commit']} does not preserve the "
-                    "Reviewer acceptance binding"
-                )
+    replay_checkpoint_chain(chain)
     return chain
 
 
@@ -734,34 +1102,17 @@ def assert_next_checkpoint(
     iteration: int,
 ) -> None:
     role_label = checkpoint_role_label(role)
-    if not chain:
-        expected = ("Planner", 0)
-    else:
-        previous = chain[-1]
-        previous_role = str(previous["role"])
-        previous_iteration = int(previous["iteration"])
-        if previous_role == "Planner":
-            expected = (
-                "Implementer",
-                1 if previous_iteration == 0 else previous_iteration,
-            )
-        elif previous_role == "Implementer":
-            expected = ("Reviewer", previous_iteration)
-        elif previous_role == "Reviewer":
-            if previous["verdict"] == "ACCEPTED":
-                expected = ("Closure", previous_iteration)
-            elif previous["verdict"] in {"NEEDS_REPLAN", "BLOCKED"}:
-                expected = ("Planner", previous_iteration + 1)
-            elif role_label in {"Planner", "Implementer"}:
-                expected = (role_label, previous_iteration + 1)
-            else:
-                expected = ("Implementer", previous_iteration + 1)
-        else:
-            raise RalphError("Closure is terminal; no further checkpoint is allowed")
-    if (role_label, iteration) != expected:
+    state = replay_checkpoint_chain(chain)
+    expected = state["expected"]
+    assert isinstance(expected, set)
+    if state["status"] != "ACTIVE" or (role_label, iteration) not in expected:
+        wanted = ", ".join(
+            f"{item_role} iteration {item_iteration}"
+            for item_role, item_iteration in sorted(expected)
+        ) or "no role checkpoint"
         raise RalphError(
-            f"next Ralph checkpoint must be {expected[0]} iteration {expected[1]}, "
-            f"not {role_label} iteration {iteration}"
+            f"next Ralph checkpoint cannot be {role_label} iteration {iteration}; "
+            f"state is {state['status']} and expected {wanted}"
         )
 
 
@@ -1097,9 +1448,30 @@ def assert_snapshot_matches_commit(
 
 
 def clean_cell(value: str) -> str:
-    value = value.strip().strip("`").strip()
+    value = value.replace(r"\|", "|").strip().strip("`").strip()
     link = re.fullmatch(r"\[[^\]]+\]\(([^)]+)\)", value)
     return link.group(1).strip() if link else value
+
+
+def split_markdown_row(line: str) -> list[str]:
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for character in line.strip()[1:-1]:
+        if escaped:
+            current.extend(("\\", character))
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "|":
+            cells.append("".join(current))
+            current = []
+        else:
+            current.append(character)
+    if escaped:
+        current.append("\\")
+    cells.append("".join(current))
+    return cells
 
 
 def markdown_rows(section_text: str) -> list[list[str]]:
@@ -1108,7 +1480,7 @@ def markdown_rows(section_text: str) -> list[list[str]]:
         stripped = line.strip()
         if not stripped.startswith("|") or not stripped.endswith("|"):
             continue
-        cells = [clean_cell(cell) for cell in stripped[1:-1].split("|")]
+        cells = [clean_cell(cell) for cell in split_markdown_row(stripped)]
         if cells and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
             continue
         rows.append(cells)
@@ -1150,6 +1522,9 @@ def parse_deliverables(plan: str) -> list[dict[str, str]]:
         "path": {"path", "target"},
         "required": {"required"},
         "status": {"status"},
+        "class": {"class", "profile", "deliverable class"},
+        "guarded": {"guarded", "budget guarded"},
+        "budget": {"guard budget", "budget"},
     }
     columns: dict[str, int] = {}
     for key, names in aliases.items():
@@ -1173,6 +1548,9 @@ def parse_deliverables(plan: str) -> list[dict[str, str]]:
                 "path": row[columns["path"]],
                 "required": row[columns["required"]] if "required" in columns else "Yes",
                 "status": row[columns["status"]] if "status" in columns else "",
+                "class": row[columns["class"]] if "class" in columns else "",
+                "guarded": row[columns["guarded"]] if "guarded" in columns else "",
+                "budget": row[columns["budget"]] if "budget" in columns else "",
             }
         )
     return parsed
@@ -1191,7 +1569,80 @@ def strip_comments(text: str) -> str:
     return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
 
 
-def latest_review(verify: str) -> dict[str, object] | None:
+def parse_findings(review_block: str) -> dict[str, object]:
+    rows = markdown_rows(markdown_subsection(review_block, "Findings"))
+    if not rows:
+        return {"schema": "missing", "findings": [], "errors": []}
+    aliases = {
+        "id": {"finding", "id"},
+        "acs": {"acs", "ac"},
+        "type": {"type", "finding type"},
+        "severity": {"severity"},
+        "status": {"status"},
+        "evidence": {"evidence"},
+        "action_class": {"action class", "action"},
+        "required_action": {"required action", "remediation"},
+    }
+    header = [cell.casefold() for cell in rows[0]]
+    columns: dict[str, int] = {}
+    for key, names in aliases.items():
+        for index, value in enumerate(header):
+            if value in names:
+                columns[key] = index
+                break
+    typed = {"id", "acs", "type", "severity", "status"}.issubset(columns)
+    legacy = (
+        {"id", "acs", "severity", "status"}.issubset(columns)
+        and "type" not in columns
+    )
+    if not typed and not legacy:
+        return {
+            "schema": "invalid",
+            "findings": [],
+            "errors": ["Findings table has invalid or unrecognized columns"],
+        }
+    parsed: list[dict[str, str]] = []
+    errors: list[str] = []
+    for row in rows[1:]:
+        if "id" not in columns or len(row) <= columns["id"]:
+            continue
+        finding_id = row[columns["id"]]
+        if not re.fullmatch(r"F-\d{3,}", finding_id):
+            continue
+
+        def value(key: str) -> str:
+            index = columns.get(key)
+            return row[index].strip() if index is not None and index < len(row) else ""
+
+        finding = {
+            "id": finding_id,
+            "acs": value("acs"),
+            "type": value("type").upper(),
+            "severity": value("severity").upper(),
+            "status": value("status").upper(),
+            "evidence": value("evidence"),
+            "action_class": value("action_class").upper(),
+            "required_action": value("required_action"),
+        }
+        if typed and (
+            not finding["type"]
+            or not finding["action_class"]
+            or not finding["required_action"]
+        ):
+            errors.append(f"{finding_id} lacks Type, Action class, or Required action")
+        parsed.append(finding)
+    return {
+        "schema": "typed" if typed else "legacy",
+        "findings": parsed,
+        "errors": errors,
+    }
+
+
+def latest_review(
+    verify: str,
+    *,
+    legacy_findings: bool = False,
+) -> dict[str, object] | None:
     visible = strip_comments(verify)
     headings = list(re.finditer(r"(?m)^##\s+(ITER-(\d{3,}))\s+Review\s*$", visible))
     if not headings:
@@ -1218,15 +1669,14 @@ def latest_review(verify: str) -> dict[str, object] | None:
                 duplicate_decisions.append(row[0])
             decisions[row[0]] = {"result": row[1].upper(), "evidence": row[2].strip()}
 
-    open_blocking: list[str] = []
-    findings = markdown_subsection(block, "Findings")
-    for row in markdown_rows(findings):
-        if len(row) < 4 or not re.fullmatch(r"F-\d{3,}", row[0]):
-            continue
-        severity = row[2].upper()
-        status = row[3].upper()
-        if severity in {"P0", "P1"} and status == "OPEN":
-            open_blocking.append(row[0])
+    finding_data = parse_findings(block)
+    parsed_findings = finding_data["findings"]
+    assert isinstance(parsed_findings, list)
+    open_blocking = [
+        str(finding["id"])
+        for finding in parsed_findings
+        if finding["severity"] in {"P0", "P1"} and finding["status"] == "OPEN"
+    ]
 
     command_records: list[dict[str, str]] = []
     commands = markdown_subsection(block, "Commands")
@@ -1283,6 +1733,10 @@ def latest_review(verify: str) -> dict[str, object] | None:
         "decisions": decisions,
         "duplicate_decisions": duplicate_decisions,
         "open_blocking": open_blocking,
+        "findings": parsed_findings,
+        "finding_schema": finding_data["schema"],
+        "finding_errors": finding_data["errors"],
+        "legacy_findings_allowed": legacy_findings,
         "commands": command_records,
         "block": block,
     }
@@ -1334,6 +1788,359 @@ def summary_field(verify: str, name: str) -> str:
         strip_comments(verify),
     )
     return match.group(1).strip().strip("`") if match else ""
+
+
+def protocol_version(texts: Iterable[str]) -> int:
+    versions = {
+        value
+        for text in texts
+        if (value := summary_field(text, "Protocol version"))
+    }
+    if not versions:
+        return 1
+    if len(versions) != 1:
+        raise RalphError(
+            "four-pack Protocol version fields disagree: " + ", ".join(sorted(versions))
+        )
+    value = next(iter(versions))
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise RalphError(f"invalid Protocol version: {value}")
+    return int(value)
+
+
+def cell_items(value: str) -> list[str]:
+    return [
+        item.strip()
+        for item in re.split(r"(?i)<br\s*/?>|;", value)
+        if item.strip() and item.strip().casefold() not in {"n/a", "na", "none", "-"}
+    ]
+
+
+def line_limit(value: str, default: int) -> int:
+    cleaned = value.strip().replace(",", "").casefold()
+    if not cleaned or cleaned == "default":
+        return default
+    match = re.fullmatch(r"([1-9][0-9]*)\s*(?:lines?)?", cleaned)
+    if not match:
+        raise RalphError(f"invalid line budget: {value}")
+    return int(match.group(1))
+
+
+def guard_scope(raw: str, workspace_root: Path) -> str:
+    value = raw.strip().strip("`")
+    value = re.sub(r"/\*\*?$", "", value).rstrip("/")
+    path = workspace_path(value, workspace_root, "guarded path")
+    return git_relative(path, workspace_root, "guarded path")
+
+
+def parse_guard_budgets(
+    proposal: str,
+    workspace_root: Path,
+) -> tuple[list[dict[str, object]], list[str]]:
+    rows = markdown_rows(markdown_section(proposal, "Guard Budgets"))
+    if not rows:
+        return [], ["proposal.md has no Guard Budgets table"]
+    header = [cell.casefold() for cell in rows[0]]
+    wanted = {
+        "id": "budget",
+        "profile": "profile",
+        "paths": "guarded deliverable paths",
+        "warning": "warning",
+        "iteration_pause": "iteration pause",
+        "cumulative_pause": "cumulative pause",
+        "per_path_pause": "per-path pause",
+        "exclusions": "exclusions",
+    }
+    columns = {
+        key: header.index(label)
+        for key, label in wanted.items()
+        if label in header
+    }
+    if not {"id", "profile", "paths"}.issubset(columns):
+        return [], ["Guard Budgets table has invalid columns"]
+    budgets: list[dict[str, object]] = []
+    errors: list[str] = []
+    for row in rows[1:]:
+        if len(row) <= max(columns.values()):
+            continue
+
+        def value(key: str) -> str:
+            index = columns.get(key)
+            return row[index] if index is not None and index < len(row) else ""
+
+        budget_id = value("id")
+        if not budget_id or budget_id.casefold() in {"budget", "n/a"}:
+            continue
+        profile = value("profile").upper()
+        if profile not in GUARD_DEFAULTS:
+            errors.append(f"{budget_id} has invalid guard Profile {profile or 'missing'}")
+            continue
+        defaults = GUARD_DEFAULTS[profile]
+        try:
+            paths = [
+                guard_scope(item, workspace_root)
+                for item in cell_items(value("paths"))
+            ]
+            exclusions: list[str] = []
+            for item in cell_items(value("exclusions")):
+                if "::" not in item:
+                    errors.append(
+                        f"{budget_id} exclusion must be 'path :: reason': {item}"
+                    )
+                    continue
+                raw_path, reason = (part.strip() for part in item.split("::", 1))
+                if not raw_path or not reason:
+                    errors.append(f"{budget_id} has an unreasoned exclusion: {item}")
+                    continue
+                exclusions.append(guard_scope(raw_path, workspace_root))
+            budgets.append(
+                {
+                    "id": budget_id,
+                    "profile": profile,
+                    "paths": paths,
+                    "exclusions": exclusions,
+                    "warning": line_limit(
+                        value("warning"), int(defaults["warning"])
+                    ),
+                    "iteration_pause": line_limit(
+                        value("iteration_pause"),
+                        int(defaults["iteration_pause"]),
+                    ),
+                    "cumulative_pause": line_limit(
+                        value("cumulative_pause"),
+                        int(defaults["cumulative_pause"]),
+                    ),
+                    "per_path_pause": line_limit(
+                        value("per_path_pause"),
+                        int(defaults["per_path_pause"]),
+                    ),
+                }
+            )
+        except RalphError as exc:
+            errors.append(f"{budget_id}: {exc}")
+    return budgets, errors
+
+
+def parse_external_dependencies(proposal: str) -> tuple[list[dict[str, str]], list[str]]:
+    rows = markdown_rows(
+        markdown_section(proposal, "External Dependency Registry")
+    )
+    if not rows:
+        return [], ["proposal.md has no External Dependency Registry table"]
+    header = [cell.casefold() for cell in rows[0]]
+    required = {
+        "dependency": "dependency",
+        "acs": "blocking acs",
+        "required_evidence": "required immutable evidence",
+        "owner": "owner",
+        "status": "initial status",
+        "proof": "unblock proof",
+    }
+    columns = {
+        key: header.index(label)
+        for key, label in required.items()
+        if label in header
+    }
+    if set(columns) != set(required):
+        return [], ["External Dependency Registry has invalid columns"]
+    dependencies: list[dict[str, str]] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    valid_acs = set(extract_ac_ids(proposal))
+    for row in rows[1:]:
+        if len(row) <= max(columns.values()):
+            continue
+        dependency = row[columns["dependency"]]
+        if dependency.casefold() in {"n/a", "na", "none", "-"}:
+            continue
+        if not re.fullmatch(r"DEP-\d{3,}", dependency):
+            errors.append(f"invalid external dependency ID: {dependency}")
+        elif dependency in seen:
+            errors.append(f"duplicate external dependency ID: {dependency}")
+        seen.add(dependency)
+        acs = set(re.findall(r"AC-\d{3,}", row[columns["acs"]]))
+        if not acs:
+            errors.append(f"{dependency} has no Blocking AC")
+        unknown = sorted(acs - valid_acs)
+        if unknown:
+            errors.append(
+                f"{dependency} references unknown Blocking ACs: "
+                + ", ".join(unknown)
+            )
+        if not row[columns["required_evidence"]].strip():
+            errors.append(f"{dependency} has no Required immutable evidence")
+        if not row[columns["owner"]].strip():
+            errors.append(f"{dependency} has no Owner")
+        if not row[columns["proof"]].strip():
+            errors.append(f"{dependency} has no Unblock proof")
+        status = row[columns["status"]].upper()
+        if status not in {"READY", "BLOCKED"}:
+            errors.append(
+                f"{dependency} has invalid external dependency status "
+                f"{status or 'missing'}"
+            )
+        dependencies.append(
+            {
+                "dependency": dependency,
+                "acs": row[columns["acs"]],
+                "required_evidence": row[columns["required_evidence"]],
+                "owner": row[columns["owner"]],
+                "status": status,
+                "proof": row[columns["proof"]],
+            }
+        )
+    return dependencies, errors
+
+
+def deliverable_budget_coverage(
+    plan: str,
+    budgets: list[dict[str, object]],
+    workspace_root: Path,
+) -> list[str]:
+    guarded = [
+        scope
+        for budget in budgets
+        for scope in budget["paths"]
+        if isinstance(scope, str)
+    ]
+    excluded = [
+        scope
+        for budget in budgets
+        for scope in budget["exclusions"]
+        if isinstance(scope, str)
+    ]
+    errors: list[str] = []
+    for item in parse_deliverables(plan):
+        try:
+            path = git_relative(
+                normalize_artifact_path(item["path"], workspace_root),
+                workspace_root,
+                "deliverable",
+            )
+        except RalphError as exc:
+            errors.append(str(exc))
+            continue
+        if not path_in_scopes(path, guarded) and not path_in_scopes(path, excluded):
+            errors.append(
+                f"{item['id']} path {path} is neither budget-guarded nor "
+                "explicitly excluded with a reason"
+            )
+    return errors
+
+
+def diff_added_lines(
+    workspace_root: Path,
+    baseline: str,
+    scopes: Iterable[str],
+    *,
+    end: str | None = None,
+    include_untracked: bool = False,
+) -> tuple[dict[str, int], list[str]]:
+    scope_list = sorted(set(scopes))
+    if not scope_list:
+        return {}, []
+    arguments = ["diff", "--numstat", "-z", "--no-renames", baseline]
+    if end is not None:
+        arguments.append(end)
+    arguments.extend(["--", *literal_pathspecs(scope_list)])
+    output = run_git_bytes(workspace_root, arguments).stdout
+    additions: dict[str, int] = {}
+    binary: list[str] = []
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        parts = record.split(b"\t", 2)
+        if len(parts) != 3:
+            continue
+        added, _, raw_path = parts
+        path = raw_path.decode("utf-8", errors="surrogateescape")
+        if added == b"-":
+            binary.append(path)
+        elif added.isdigit():
+            additions[path] = additions.get(path, 0) + int(added)
+    if include_untracked:
+        untracked = nul_paths(
+            run_git(
+                workspace_root,
+                ["ls-files", "--others", "--exclude-standard", "-z"],
+            ).stdout
+        )
+        for path in sorted(untracked):
+            if not path_in_scopes(path, scope_list):
+                continue
+            source = workspace_root / path
+            if source.is_symlink():
+                binary.append(path)
+                continue
+            line_count = 0
+            saw_data = False
+            final_byte = b""
+            with source.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    if b"\0" in chunk:
+                        binary.append(path)
+                        line_count = -1
+                        break
+                    saw_data = True
+                    final_byte = chunk[-1:]
+                    line_count += chunk.count(b"\n")
+            if line_count >= 0:
+                additions[path] = line_count + int(saw_data and final_byte != b"\n")
+    return additions, sorted(set(binary))
+
+
+def review_guard_metrics(verify: str) -> dict[str, object]:
+    rows: list[dict[str, object]] = []
+    for number, block in sorted(review_blocks(verify).items()):
+        data = parse_findings(block)
+        findings = data["findings"]
+        assert isinstance(findings, list)
+        blocking = [
+            item
+            for item in findings
+            if item["status"] == "OPEN" and item["severity"] in {"P0", "P1"}
+        ]
+        assurance = [
+            item for item in blocking if item["type"] == "ASSURANCE_DEFECT"
+        ]
+        rows.append(
+            {
+                "iteration": number,
+                "verdict": summary_field(block, "Verdict").upper(),
+                "blocking": len(blocking),
+                "assurance": len(assurance),
+                "assurance_ratio": (
+                    len(assurance) / len(blocking) if blocking else 0.0
+                ),
+                "escalated_assurance": any(
+                    item["type"] == "ASSURANCE_DEFECT"
+                    and item["status"] == "OPEN"
+                    and item["action_class"] == "ESCALATE"
+                    for item in findings
+                ),
+                "schema": data["schema"],
+            }
+        )
+    nonaccepted = sum(
+        row["verdict"] in VERDICTS - {"ACCEPTED"} for row in rows
+    )
+    consecutive_replan = 0
+    for row in reversed(rows):
+        if row["verdict"] != "NEEDS_REPLAN":
+            break
+        consecutive_replan += 1
+    assurance_dominated = 0
+    for row in reversed(rows):
+        if row["blocking"] and float(row["assurance_ratio"]) >= 0.5:
+            assurance_dominated += 1
+        else:
+            break
+    return {
+        "reviews": rows,
+        "nonaccepted": nonaccepted,
+        "consecutive_needs_replan": consecutive_replan,
+        "consecutive_assurance_dominated": assurance_dominated,
+    }
 
 
 def review_numbers(verify: str) -> list[int]:
@@ -1589,17 +2396,276 @@ def four_pack_dirs_with_identity(workspace_root: Path, identity: str) -> list[Pa
     return matches
 
 
+def validate_finding_history(
+    verify: str,
+    *,
+    version: int,
+    phase: str,
+    legacy_findings: bool,
+    valid_acs: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    signatures: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for number, block in sorted(review_blocks(verify).items()):
+        data = parse_findings(block)
+        schema = str(data["schema"])
+        findings = data["findings"]
+        finding_errors = data["errors"]
+        assert isinstance(findings, list)
+        assert isinstance(finding_errors, list)
+        errors.extend(f"ITER-{number:03d}: {value}" for value in finding_errors)
+        if version >= 2 and schema != "typed":
+            errors.append(
+                f"ITER-{number:03d} Findings must use the protocol-v2 typed schema"
+            )
+        elif version == 1 and schema == "legacy":
+            if phase == "reviewed" and findings and not legacy_findings:
+                errors.append(
+                    f"ITER-{number:03d} uses legacy Findings; active continuation "
+                    "requires --legacy-findings or protocol-v2 migration"
+                )
+            else:
+                warnings.append(
+                    f"ITER-{number:03d} uses legacy unclassified Findings"
+                )
+
+        seen: set[str] = set()
+        for finding in findings:
+            finding_id = str(finding["id"])
+            finding_type = str(finding["type"])
+            action_class = str(finding["action_class"])
+            if finding_id in seen:
+                errors.append(f"ITER-{number:03d} repeats finding {finding_id}")
+            seen.add(finding_id)
+            if schema != "typed":
+                continue
+            if finding_type not in FINDING_TYPES:
+                errors.append(
+                    f"ITER-{number:03d} {finding_id} has invalid Type "
+                    f"{finding_type or 'missing'}"
+                )
+            if action_class not in FINDING_ACTIONS:
+                errors.append(
+                    f"ITER-{number:03d} {finding_id} has invalid Action class "
+                    f"{action_class or 'missing'}"
+                )
+            status = str(finding["status"])
+            severity = str(finding["severity"])
+            if status not in {"OPEN", "CLOSED"}:
+                errors.append(
+                    f"ITER-{number:03d} {finding_id} has invalid Status "
+                    f"{status or 'missing'}"
+                )
+            if severity not in {"P0", "P1", "P2", "P3"}:
+                errors.append(
+                    f"ITER-{number:03d} {finding_id} has invalid Severity "
+                    f"{severity or 'missing'}"
+                )
+            if status == "CLOSED" and action_class != "CLOSE":
+                errors.append(
+                    f"ITER-{number:03d} {finding_id} CLOSED finding must use CLOSE"
+                )
+            if status == "OPEN" and action_class == "CLOSE":
+                errors.append(
+                    f"ITER-{number:03d} {finding_id} OPEN finding must not use CLOSE"
+                )
+            allowed_actions = {
+                "SUBJECT_DEFECT": {"SUBJECT_FIX", "CLOSE"},
+                "ASSURANCE_DEFECT": ASSURANCE_ACTIONS | {"CLOSE"},
+                "CONTRACT_GAP": {"REPLAN", "CLOSE"},
+                "EXTERNAL_BLOCKER": {"UNBLOCK_EXTERNAL", "CLOSE"},
+            }.get(finding_type, set())
+            if action_class not in allowed_actions:
+                errors.append(
+                    f"ITER-{number:03d} {finding_id} Action class {action_class} "
+                    f"is invalid for {finding_type}"
+                )
+            if (
+                finding_type == "ASSURANCE_DEFECT"
+                and str(finding["status"]) == "OPEN"
+                and action_class not in ASSURANCE_ACTIONS
+            ):
+                errors.append(
+                    f"ITER-{number:03d} {finding_id} open ASSURANCE_DEFECT must use "
+                    "SHRINK_ASSURANCE, DIRECT_RECOMPUTE, MINIMAL_LOCAL_FIX, or ESCALATE"
+                )
+            ac_set = set(re.findall(r"AC-\d{3,}", str(finding["acs"])))
+            if not ac_set:
+                errors.append(f"ITER-{number:03d} {finding_id} has no AC mapping")
+            if valid_acs is not None:
+                unknown_acs = sorted(ac_set - valid_acs)
+                if unknown_acs:
+                    errors.append(
+                        f"ITER-{number:03d} {finding_id} maps unknown ACs: "
+                        + ", ".join(unknown_acs)
+                    )
+            if not str(finding["evidence"]).strip():
+                errors.append(
+                    f"ITER-{number:03d} {finding_id} has no concrete Evidence"
+                )
+            acs = tuple(sorted(ac_set))
+            signature = (finding_type, acs)
+            previous = signatures.get(finding_id)
+            if previous is not None and previous != signature:
+                errors.append(
+                    f"{finding_id} changed immutable Type/AC identity across reviews"
+                )
+            signatures.setdefault(finding_id, signature)
+
+        verdict = summary_field(block, "Verdict").upper()
+        open_findings = [
+            finding
+            for finding in findings
+            if str(finding["status"]) == "OPEN"
+        ]
+        open_external = [
+            finding
+            for finding in open_findings
+            if str(finding["type"]) == "EXTERNAL_BLOCKER"
+        ]
+        open_contract = [
+            finding
+            for finding in open_findings
+            if str(finding["type"]) == "CONTRACT_GAP"
+            and str(finding["action_class"]) == "REPLAN"
+        ]
+        if schema == "typed":
+            if open_external and verdict != "BLOCKED":
+                errors.append(
+                    f"ITER-{number:03d} has open EXTERNAL_BLOCKER findings, "
+                    "so Verdict must be BLOCKED"
+                )
+            if verdict == "BLOCKED" and not any(
+                str(finding["action_class"]) == "UNBLOCK_EXTERNAL"
+                for finding in open_external
+            ):
+                errors.append(
+                    f"ITER-{number:03d} BLOCKED requires an open EXTERNAL_BLOCKER "
+                    "with UNBLOCK_EXTERNAL"
+                )
+            if verdict == "NEEDS_REPLAN" and not open_contract:
+                errors.append(
+                    f"ITER-{number:03d} NEEDS_REPLAN requires an open CONTRACT_GAP "
+                    "with REPLAN"
+                )
+            if open_contract and not open_external and verdict != "NEEDS_REPLAN":
+                errors.append(
+                    f"ITER-{number:03d} has an open CONTRACT_GAP and no external "
+                    "blocker, so Verdict must be NEEDS_REPLAN"
+                )
+            if verdict == "CHANGES_REQUIRED" and (open_contract or open_external):
+                errors.append(
+                    f"ITER-{number:03d} CHANGES_REQUIRED permits only open "
+                    "SUBJECT_DEFECT or ASSURANCE_DEFECT findings"
+                )
+    return errors, warnings
+
+
+def replan_disposition_errors(
+    plan: str,
+    verify: str,
+    iteration: int,
+) -> list[str]:
+    review = latest_review(verify)
+    if review is None:
+        return []
+    findings = review["findings"]
+    assert isinstance(findings, list)
+    triggering = {
+        str(item["id"]) for item in findings if str(item["status"]) == "OPEN"
+    }
+    if not triggering:
+        return []
+    rows = markdown_rows(markdown_section(plan, "Finding Disposition Ledger"))
+    if not rows:
+        return ["Finding Disposition Ledger is missing"]
+    header = [cell.casefold() for cell in rows[0]]
+    required = {
+        "iteration": "iteration",
+        "finding": "finding",
+        "disposition": "disposition",
+    }
+    columns = {
+        key: header.index(label)
+        for key, label in required.items()
+        if label in header
+    }
+    if set(columns) != set(required):
+        return ["Finding Disposition Ledger has invalid columns"]
+    dispositions: dict[str, str] = {}
+    errors: list[str] = []
+    for row in rows[1:]:
+        if len(row) <= max(columns.values()):
+            continue
+        raw_iteration = row[columns["iteration"]].upper()
+        if raw_iteration not in {str(iteration), f"ITER-{iteration:03d}"}:
+            continue
+        finding_id = row[columns["finding"]].upper()
+        if not re.fullmatch(r"F-\d{3,}", finding_id):
+            continue
+        if finding_id in dispositions:
+            errors.append(
+                f"planner replan repeats disposition for {finding_id}"
+            )
+        dispositions[finding_id] = row[columns["disposition"]].upper()
+    missing = sorted(triggering - set(dispositions))
+    unknown = sorted(set(dispositions) - triggering)
+    invalid = sorted(
+        finding_id
+        for finding_id, value in dispositions.items()
+        if value not in {"FIX", "DESCOPE", "DEFER", "ESCALATE"}
+    )
+    if missing:
+        errors.append(
+            "planner replan has no disposition for open findings: "
+            + ", ".join(missing)
+        )
+    if unknown:
+        errors.append(
+            "planner replan disposition references non-triggering findings: "
+            + ", ".join(unknown)
+        )
+    if invalid:
+        errors.append(
+            "planner replan has invalid finding dispositions: "
+            + ", ".join(invalid)
+        )
+    return errors
+
+
 def validate_task(
     task_dir: Path,
     workspace_root: Path,
     phase: str,
     index: Path | None,
     explicit_artifacts: Iterable[str],
+    *,
+    legacy_findings: bool = False,
 ) -> tuple[list[str], list[str], dict[str, object]]:
     texts = require_four_pack(task_dir)
     errors: list[str] = []
     warnings: list[str] = []
     identity = task_identity(task_dir, texts["proposal.md"])
+    try:
+        version = protocol_version(texts.values())
+    except RalphError as exc:
+        errors.append(str(exc))
+        version = 2
+    if version >= 2:
+        _, dependency_errors = parse_external_dependencies(
+            texts["proposal.md"]
+        )
+        errors.extend(dependency_errors)
+        budgets, budget_errors = parse_guard_budgets(
+            texts["proposal.md"], workspace_root
+        )
+        errors.extend(budget_errors)
+        errors.extend(
+            deliverable_budget_coverage(
+                texts["plan.md"], budgets, workspace_root
+            )
+        )
     try:
         git_context = git_context_data(workspace_root)
     except RalphError as exc:
@@ -1744,7 +2810,19 @@ def validate_task(
             "required deliverables have no Delivery Item: " + ", ".join(unmapped_required)
         )
 
-    review = latest_review(texts["verify.md"])
+    finding_errors, finding_warnings = validate_finding_history(
+        texts["verify.md"],
+        version=version,
+        phase=phase,
+        legacy_findings=legacy_findings,
+        valid_acs=set(ac_ids),
+    )
+    errors.extend(finding_errors)
+    warnings.extend(finding_warnings)
+    review = latest_review(
+        texts["verify.md"],
+        legacy_findings=legacy_findings,
+    )
     snapshot = snapshot_data(task_dir, workspace_root, explicit_artifacts)
     roles = iteration_roles(texts["plan.md"])
     if not roles:
@@ -2203,6 +3281,516 @@ def git_context_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def authorization_sha256(token: str | None) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
+
+
+def infer_control_iteration(
+    state: dict[str, object],
+    action: str,
+    resume_role: str,
+) -> int:
+    if action == "RESUME":
+        suspended = state["suspended_expected"]
+        assert isinstance(suspended, set)
+        matches = sorted(
+            iteration for role, iteration in suspended if role == resume_role
+        )
+        if len(matches) != 1:
+            raise RalphError(
+                f"cannot infer one legal {resume_role} resume iteration"
+            )
+        return matches[0]
+    if action in {"PLAN_QUERY", "PLAN_RESPONSE"}:
+        candidates = state["expected"] or state["suspended_expected"]
+        assert isinstance(candidates, set)
+        iterations = sorted({iteration for _, iteration in candidates})
+        if len(iterations) != 1:
+            raise RalphError("cannot infer one plan consultation iteration")
+        return iterations[0]
+    previous = state["last_substantive"]
+    return int(previous["iteration"]) if isinstance(previous, dict) else 0
+
+
+def wip_fingerprint(workspace_root: Path) -> dict[str, object]:
+    tracked = run_git_bytes(
+        workspace_root,
+        ["diff", "--binary", "--no-ext-diff", "HEAD"],
+    ).stdout
+    untracked = sorted(
+        nul_paths(
+            run_git(
+                workspace_root,
+                ["ls-files", "--others", "--exclude-standard", "-z"],
+            ).stdout
+        )
+    )
+    entries: list[tuple[str, str]] = []
+    for relative in untracked:
+        path = workspace_root / relative
+        if path.is_file() or path.is_symlink():
+            entries.append((relative, str(hash_path(path))))
+        else:
+            entries.append((relative, "unsupported"))
+    return {
+        "tracked_sha256": hashlib.sha256(tracked).hexdigest(),
+        "untracked": entries,
+    }
+
+
+def legacy_guard_budgets(
+    plan: str,
+    workspace_root: Path,
+) -> list[dict[str, object]]:
+    budgets: list[dict[str, object]] = []
+    for item in parse_deliverables(plan):
+        profile = item["class"].upper()
+        if profile not in GUARD_DEFAULTS:
+            profile = "CODE"
+        defaults = GUARD_DEFAULTS[profile]
+        path = git_relative(
+            normalize_artifact_path(item["path"], workspace_root),
+            workspace_root,
+            "deliverable",
+        )
+        budgets.append(
+            {
+                "id": f"LEGACY-{item['id']}",
+                "profile": profile,
+                "paths": [path],
+                "exclusions": [],
+                **defaults,
+            }
+        )
+    return budgets
+
+
+def guard_data(
+    workspace_root: Path,
+    task_dir: Path,
+    task_id: str,
+    role: str,
+    explicit_artifacts: Iterable[str],
+    *,
+    legacy_findings: bool,
+    allow_primary_worktree: bool = False,
+) -> dict[str, object]:
+    texts = require_four_pack(task_dir)
+    if task_identity(task_dir, texts["proposal.md"]) != task_id:
+        raise RalphError("--task-id does not match the four-pack")
+    context = require_loop_git_context(
+        workspace_root,
+        task_id,
+        require_linked=not allow_primary_worktree,
+    )
+    base_commit = summary_field(texts["plan.md"], "Base commit").lower()
+    chain = task_commit_chain(
+        workspace_root,
+        task_id,
+        base_commit,
+        str(context["head"]),
+        current_plan=texts["plan.md"],
+        require_initialized=True,
+    )
+    state = replay_checkpoint_chain(chain)
+    try:
+        version = protocol_version(texts.values())
+    except RalphError:
+        version = 2
+    reasons: set[str] = set()
+    details: list[str] = []
+    warnings: list[str] = []
+    budget_results: list[dict[str, object]] = []
+    if state["status"] == "PAUSED":
+        reasons.update(state["pause_reasons"])
+    elif state["status"] == "AWAITING_PAUSE":
+        reasons.update(state["required_pause_reasons"])
+    elif state["status"] in {"CLOSED", "ABANDONED", "CONSULTING"}:
+        reasons.add("USER_CHECKPOINT")
+        details.append(f"lifecycle state {state['status']} has no role continuation")
+
+    if version == 1 and review_blocks(texts["verify.md"]) and not legacy_findings:
+        reasons.add("SCHEMA_MIGRATION")
+        details.append(
+            "protocol-v1 active continuation requires --legacy-findings or migration"
+        )
+    if version >= 2:
+        dependencies, dependency_errors = parse_external_dependencies(
+            texts["proposal.md"]
+        )
+        if dependency_errors:
+            reasons.add("CONFIGURATION_GAP")
+            details.extend(dependency_errors)
+        blocked_dependencies = [
+            item["dependency"]
+            for item in dependencies
+            if item["status"] == "BLOCKED"
+        ]
+        if blocked_dependencies:
+            reasons.add("EXTERNAL")
+            details.append(
+                "blocked external dependencies: "
+                + ", ".join(blocked_dependencies)
+            )
+
+    if role == "planner-replan":
+        declared_budgets, _ = parse_guard_budgets(
+            texts["proposal.md"], workspace_root
+        )
+        planner_profile = (
+            "DOCUMENT"
+            if declared_budgets
+            and all(item["profile"] == "DOCUMENT" for item in declared_budgets)
+            else "CODE"
+        )
+        planner_limits = (
+            {
+                "warning": 1000,
+                "iteration_pause": 2000,
+                "cumulative_pause": 6000,
+                "per_path_pause": 4000,
+            }
+            if planner_profile == "DOCUMENT"
+            else {
+                "warning": 500,
+                "iteration_pause": 1000,
+                "cumulative_pause": 3000,
+                "per_path_pause": 2000,
+            }
+        )
+        planner_paths = [
+            git_relative(task_dir / name, workspace_root, name)
+            for name in ("design.md", "plan.md")
+        ]
+        budgets = [
+            {
+                "id": "PLANNER-REPLAN-DEFAULT",
+                "profile": planner_profile,
+                "paths": planner_paths,
+                "exclusions": [],
+                **planner_limits,
+            }
+        ]
+        cumulative_base = str(chain[0]["commit"])
+    elif role == "implementer":
+        budgets, configuration = parse_guard_budgets(
+            texts["proposal.md"], workspace_root
+        )
+        if version == 1:
+            budgets = legacy_guard_budgets(texts["plan.md"], workspace_root)
+            configuration = []
+        else:
+            configuration.extend(
+                deliverable_budget_coverage(
+                    texts["plan.md"], budgets, workspace_root
+                )
+            )
+            guarded_scopes = [
+                scope for budget in budgets for scope in budget["paths"]
+            ]
+            excluded_scopes = [
+                scope for budget in budgets for scope in budget["exclusions"]
+            ]
+            for raw in explicit_artifacts:
+                path = git_relative(
+                    normalize_artifact_path(raw, workspace_root),
+                    workspace_root,
+                    "explicit artifact",
+                )
+                if not path_in_scopes(path, guarded_scopes) and not path_in_scopes(
+                    path, excluded_scopes
+                ):
+                    configuration.append(
+                        f"explicit artifact {path} has no guard budget or exclusion"
+                    )
+        if configuration:
+            reasons.add("CONFIGURATION_GAP")
+            details.extend(configuration)
+        cumulative_base = base_commit
+    else:
+        budgets = []
+        cumulative_base = base_commit
+
+    for budget in budgets:
+        scopes = list(budget["paths"])
+        exclusions = list(budget["exclusions"])
+        iteration_lines, iteration_binary = diff_added_lines(
+            workspace_root,
+            str(context["head"]),
+            scopes,
+            include_untracked=True,
+        )
+        cumulative_lines, cumulative_binary = diff_added_lines(
+            workspace_root,
+            cumulative_base,
+            scopes,
+            include_untracked=True,
+        )
+        iteration_lines = {
+            path: count
+            for path, count in iteration_lines.items()
+            if not path_in_scopes(path, exclusions)
+        }
+        cumulative_lines = {
+            path: count
+            for path, count in cumulative_lines.items()
+            if not path_in_scopes(path, exclusions)
+        }
+        binary = sorted(
+            {
+                path
+                for path in iteration_binary + cumulative_binary
+                if not path_in_scopes(path, exclusions)
+            }
+        )
+        iteration_total = sum(iteration_lines.values())
+        cumulative_total = sum(cumulative_lines.values())
+        warning_limit = int(budget["warning"])
+        iteration_limit = int(budget["iteration_pause"])
+        cumulative_limit = int(budget["cumulative_pause"])
+        per_path_limit = int(budget["per_path_pause"])
+        over_paths = {
+            path: count
+            for path, count in cumulative_lines.items()
+            if count >= per_path_limit
+        }
+        if iteration_total >= warning_limit:
+            warnings.append(
+                f"{budget['id']} iteration additions {iteration_total} "
+                f"reached warning {warning_limit}"
+            )
+        if (
+            iteration_total >= iteration_limit
+            or cumulative_total >= cumulative_limit
+            or over_paths
+        ):
+            reasons.add("BUDGET")
+        if binary:
+            reasons.add("CONFIGURATION_GAP")
+            details.append(
+                f"{budget['id']} has guarded binary/non-text paths requiring exclusion: "
+                + ", ".join(binary)
+            )
+        budget_results.append(
+            {
+                "id": budget["id"],
+                "profile": budget["profile"],
+                "iteration_added": iteration_total,
+                "cumulative_added": cumulative_total,
+                "per_path_added": dict(sorted(cumulative_lines.items())),
+                "limits": {
+                    "warning": warning_limit,
+                    "iteration_pause": iteration_limit,
+                    "cumulative_pause": cumulative_limit,
+                    "per_path_pause": per_path_limit,
+                },
+                "binary_or_non_text": binary,
+            }
+        )
+
+    review_metrics = review_guard_metrics(texts["verify.md"])
+    if int(review_metrics["consecutive_needs_replan"]) >= 2:
+        reasons.add("REPLAN_STORM")
+    if int(review_metrics["nonaccepted"]) >= 3:
+        reasons.add("USER_CHECKPOINT")
+    if int(review_metrics["consecutive_assurance_dominated"]) >= 2:
+        reasons.add("ASSURANCE")
+    reviews = review_metrics["reviews"]
+    assert isinstance(reviews, list)
+    if reviews and reviews[-1]["escalated_assurance"]:
+        reasons.update({"ASSURANCE", "USER_CHECKPOINT"})
+
+    if state["resolved_external"]:
+        reasons.discard("EXTERNAL")
+    if state["resume_grant"]:
+        override = set(state["resume_override"])
+        suppressible = {
+            "EXTERNAL",
+            "ASSURANCE",
+            "REPLAN_STORM",
+            "USER_CHECKPOINT",
+        }
+        if role == "planner-replan":
+            suppressible |= {"CONFIGURATION_GAP", "SCHEMA_MIGRATION"}
+        reasons -= override & suppressible
+    expected = state["expected"]
+    assert isinstance(expected, set)
+    return {
+        "decision": "PAUSED" if reasons else "CONTINUE",
+        "reasons": sorted(reasons),
+        "details": sorted(set(details)),
+        "warnings": sorted(set(warnings)),
+        "role": role,
+        "protocol_version": version,
+        "state": state["status"],
+        "next_roles": [
+            {"role": item_role, "iteration": iteration}
+            for item_role, iteration in sorted(expected)
+        ],
+        "budgets": budget_results,
+        "review_history": review_metrics,
+        "mechanism": "git-diff-numstat-no-renames-plus-untracked-line-count",
+    }
+
+
+def guard_command(args: argparse.Namespace) -> int:
+    workspace_root = resolve_existing(Path(args.workspace_root), "workspace root")
+    task_dir = resolve_existing(
+        workspace_path(args.task_dir, workspace_root, "task directory"),
+        "task directory",
+    )
+    data = guard_data(
+        workspace_root,
+        task_dir,
+        args.task_id,
+        args.role,
+        args.artifact,
+        legacy_findings=getattr(args, "legacy_findings", False),
+        allow_primary_worktree=args.allow_primary_worktree,
+    )
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0 if data["decision"] == "CONTINUE" else 1
+
+
+def control_command(args: argparse.Namespace) -> int:
+    workspace_root = resolve_existing(Path(args.workspace_root), "workspace root")
+    context = require_loop_git_context(
+        workspace_root,
+        args.task_id,
+        require_linked=not args.allow_primary_worktree,
+    )
+    if context["operations_in_progress"]:
+        raise RalphError("control refuses an in-progress Git operation")
+    if git_staged_paths(workspace_root):
+        raise RalphError("control requires an empty staging area")
+    task_dir = resolve_existing(
+        workspace_path(args.task_dir, workspace_root, "task directory"),
+        "task directory",
+    )
+    texts = require_four_pack(task_dir)
+    if task_identity(task_dir, texts["proposal.md"]) != args.task_id:
+        raise RalphError("--task-id does not match the four-pack")
+    base_commit = summary_field(texts["plan.md"], "Base commit").lower()
+    chain = task_commit_chain(
+        workspace_root,
+        args.task_id,
+        base_commit,
+        str(context["head"]),
+        current_plan=texts["plan.md"],
+        require_initialized=True,
+    )
+    state = replay_checkpoint_chain(chain)
+    action = args.action.upper().replace("-", "_")
+    resume_role = args.resume_role.title() if args.resume_role else ""
+    if action == "RESUME" and resume_role == "Planner" and git_changed_paths(
+        workspace_root
+    ):
+        raise RalphError(
+            "RESUME to Planner requires a clean worktree; keep PAUSED and resume "
+            "Implementer only for authorized contraction, or preserve the WIP "
+            "outside this role flow"
+        )
+    iteration = infer_control_iteration(state, action, resume_role)
+    reasons = sorted({value.upper() for value in args.reason})
+    transferred_paths: list[str] = []
+    for value in args.transferred_path:
+        path = workspace_path(value, workspace_root, "transferred path")
+        transferred_paths.append(git_relative(path, workspace_root, "transferred path"))
+    authorization = authorization_sha256(args.authorization_token)
+    pending_entry: dict[str, object] = {
+        "commit": "<pending-control>",
+        "role": "Control",
+        "iteration": iteration,
+        "snapshot": "",
+        "candidate": "",
+        "verdict": "",
+        "reviewer": "",
+        "control_action": action,
+        "pause_reasons": reasons,
+        "resume_role": resume_role,
+        "authorization": authorization,
+        "pq_id": args.pq_id.upper() if args.pq_id else "",
+        "plan_decision": args.decision or "",
+        "child_task": args.child_task or "",
+        "transferred_paths": transferred_paths,
+        "references": list(args.reference),
+    }
+    if action in {"PLAN_QUERY", "PLAN_RESPONSE"} and not args.summary:
+        raise RalphError(f"{action} requires --summary")
+    if action == "SPLIT":
+        validate_task_id(args.child_task or "")
+        if args.child_task == args.task_id:
+            raise RalphError("SPLIT child task must differ from the parent task")
+    apply_checkpoint_entry(state, pending_entry)
+    if action in {"PLAN_RESPONSE", "SPLIT"} and state["status"] == "PAUSED":
+        reasons = sorted(set(reasons) | set(state["pause_reasons"]))
+        pending_entry["pause_reasons"] = reasons
+
+    before = wip_fingerprint(workspace_root)
+    trailers = [
+        f"Ralph-Task: {args.task_id}",
+        "Ralph-Role: Control",
+        f"Ralph-Iteration: {iteration}",
+        f"Ralph-Control-Action: {action}",
+    ]
+    if reasons:
+        trailers.append(f"Ralph-Pause-Reasons: {json.dumps(reasons)}")
+    if resume_role:
+        trailers.append(f"Ralph-Resume-Role: {resume_role}")
+    if authorization:
+        trailers.append(f"Ralph-Authorization-SHA256: {authorization}")
+    if args.pq_id:
+        trailers.append(f"Ralph-Plan-Query: {args.pq_id.upper()}")
+    if args.decision:
+        trailers.append(f"Ralph-Plan-Decision: {args.decision}")
+    if args.reference:
+        trailers.append(
+            f"Ralph-References: {json.dumps(args.reference, ensure_ascii=True)}"
+        )
+    if args.child_task:
+        trailers.append(f"Ralph-Child-Task: {args.child_task}")
+    if transferred_paths:
+        trailers.append(
+            "Ralph-Transferred-Paths: "
+            + json.dumps(transferred_paths, ensure_ascii=True)
+        )
+    subject = args.summary or f"[{args.task_id}] control: {action.lower()}"
+    run_git(
+        workspace_root,
+        ["commit", "--allow-empty", "-m", subject, "-m", "\n".join(trailers)],
+    )
+    commit = run_git(workspace_root, ["rev-parse", "HEAD"]).stdout.strip().lower()
+    if commit_changed_paths(workspace_root, commit):
+        raise RalphError("Control checkpoint unexpectedly changed files")
+    if wip_fingerprint(workspace_root) != before:
+        raise RalphError("Control checkpoint did not preserve WIP bytes exactly")
+    committed_chain = task_commit_chain(
+        workspace_root,
+        args.task_id,
+        base_commit,
+        commit,
+        current_plan=texts["plan.md"],
+        require_initialized=True,
+    )
+    committed_state = replay_checkpoint_chain(committed_chain)
+    print(
+        json.dumps(
+            {
+                "task_id": args.task_id,
+                "action": action,
+                "iteration": iteration,
+                "commit": commit,
+                "state": committed_state["status"],
+                "pause_reasons": sorted(committed_state["pause_reasons"]),
+                "wip_preserved": True,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def checkpoint_role_label(role: str) -> str:
     return {
         "planner-init": "Planner",
@@ -2303,6 +3891,11 @@ def checkpoint_command(args: argparse.Namespace) -> int:
             "proposal",
         )
         if args.allow_contract_change:
+            if not args.authorization_token:
+                raise RalphError(
+                    "--allow-contract-change requires --authorization-token "
+                    "from explicit user approval"
+                )
             scopes.append(proposal_path)
         elif proposal_path in git_changed_paths(workspace_root):
             raise RalphError(
@@ -2347,6 +3940,57 @@ def checkpoint_command(args: argparse.Namespace) -> int:
             current_artifacts,
             task_dir,
         )
+        explicit_paths = {
+            str(normalize_artifact_path(value, workspace_root))
+            for value in artifact_arguments
+        }
+        planned_paths = {
+            str(path)
+            for path in (
+                declared_artifact_paths(previous_plan, workspace_root, [])
+                + declared_artifact_paths(texts["plan.md"], workspace_root, [])
+            )
+        }
+        if (
+            protocol_version(texts.values()) >= 2
+            and explicit_paths - planned_paths
+            and not args.authorization_token
+        ):
+            raise RalphError(
+                "protocol-v2 explicit artifacts outside the plan require explicit "
+                "user authorization: "
+                + ", ".join(sorted(explicit_paths - planned_paths))
+            )
+        added_specs = {
+            (item["id"], item["path"]) for item in parse_deliverables(texts["plan.md"])
+        } - {
+            (item["id"], item["path"]) for item in parse_deliverables(previous_plan)
+        }
+        if added_specs and not args.authorization_token:
+            raise RalphError(
+                "Implementer expanded Deliverables without explicit user authorization: "
+                + ", ".join(f"{item_id} -> {path}" for item_id, path in sorted(added_specs))
+            )
+        previous_budget_assignments = {
+            (item["id"], item["path"]): item["budget"]
+            for item in parse_deliverables(previous_plan)
+        }
+        changed_budget_assignments = sorted(
+            (item["id"], item["path"])
+            for item in parse_deliverables(texts["plan.md"])
+            if (item["id"], item["path"]) in previous_budget_assignments
+            and item["budget"]
+            != previous_budget_assignments[(item["id"], item["path"])]
+        )
+        if changed_budget_assignments and not args.authorization_token:
+            raise RalphError(
+                "Implementer changed deliverable guard-budget assignments without "
+                "explicit user authorization: "
+                + ", ".join(
+                    f"{item_id} -> {path}"
+                    for item_id, path in changed_budget_assignments
+                )
+            )
         explicitly_allowed_new = {
             str(
                 normalize_artifact_path(
@@ -2356,6 +4000,11 @@ def checkpoint_command(args: argparse.Namespace) -> int:
             )
             for value in args.allow_new_deliverable
         }
+        if explicitly_allowed_new and not args.authorization_token:
+            raise RalphError(
+                "--allow-new-deliverable requires --authorization-token "
+                "from explicit user approval"
+            )
         unexpected_new = sorted(
             str(path)
             for path in current_artifacts
@@ -2364,8 +4013,9 @@ def checkpoint_command(args: argparse.Namespace) -> int:
         )
         if unexpected_new:
             raise RalphError(
-                "Implementer introduced new deliverable paths without Controller approval; "
-                "use --allow-new-deliverable for each inspected design amendment: "
+                "Implementer introduced new deliverable paths without explicit user "
+                "authorization; use --allow-new-deliverable and --authorization-token "
+                "for each approved design amendment: "
                 + ", ".join(unexpected_new)
             )
         scopes.extend(
@@ -2390,6 +4040,11 @@ def checkpoint_command(args: argparse.Namespace) -> int:
         if review is None or int(review["number"]) != args.iteration:
             raise RalphError(
                 f"verify.md must contain latest ITER-{args.iteration:03d} before checkpoint"
+            )
+        if review["findings"] and review["finding_schema"] != "typed":
+            raise RalphError(
+                "a new Reviewer checkpoint with findings must use typed protocol-v2 "
+                "Finding and Action class columns"
             )
         candidate_commit = str(review["candidate_commit"]).lower()
         candidate_branch = str(review["candidate_branch"])
@@ -2474,6 +4129,17 @@ def checkpoint_command(args: argparse.Namespace) -> int:
         else resolve_existing(task_dir, "task directory")
     )
     checkpoint_plan = read_text(checkpoint_pack / "plan.md")
+    if args.role == "planner-replan":
+        disposition_errors = replan_disposition_errors(
+            checkpoint_plan,
+            read_text(checkpoint_pack / "verify.md"),
+            args.iteration,
+        )
+        if disposition_errors:
+            raise RalphError(
+                "planner-replan finding disposition validation failed:\n- "
+                + "\n- ".join(disposition_errors)
+            )
     base_commit = summary_field(checkpoint_plan, "Base commit").lower()
     head_commit = str(context["head"]).lower()
     if args.role == "planner-init" and base_commit != head_commit:
@@ -2488,7 +4154,61 @@ def checkpoint_command(args: argparse.Namespace) -> int:
         current_plan=checkpoint_plan,
         require_initialized=args.role != "planner-init",
     )
+    if args.role == "planner-replan":
+        previous_plan = git_file_text(
+            workspace_root,
+            head_commit,
+            git_relative(task_dir / "plan.md", workspace_root, "plan"),
+        )
+        initial_deliverables = {
+            (item["id"], item["path"]) for item in parse_deliverables(previous_plan)
+        }
+        current_deliverables = {
+            (item["id"], item["path"]) for item in parse_deliverables(checkpoint_plan)
+        }
+        expanded = sorted(current_deliverables - initial_deliverables)
+        if expanded and not args.authorization_token:
+            raise RalphError(
+                "Planner replan added or redirected deliverables without explicit "
+                "user authorization: "
+                + ", ".join(f"{item_id} -> {path}" for item_id, path in expanded)
+            )
+        previous_budget_assignments = {
+            (item["id"], item["path"]): item["budget"]
+            for item in parse_deliverables(previous_plan)
+        }
+        changed_budget_assignments = sorted(
+            (item["id"], item["path"])
+            for item in parse_deliverables(checkpoint_plan)
+            if (item["id"], item["path"]) in previous_budget_assignments
+            and item["budget"]
+            != previous_budget_assignments[(item["id"], item["path"])]
+        )
+        if changed_budget_assignments and not args.authorization_token:
+            raise RalphError(
+                "Planner replan changed deliverable guard-budget assignments "
+                "without explicit user authorization: "
+                + ", ".join(
+                    f"{item_id} -> {path}"
+                    for item_id, path in changed_budget_assignments
+                )
+            )
     assert_next_checkpoint(chain, args.role, args.iteration)
+    if args.role in {"planner-replan", "implementer"}:
+        guard = guard_data(
+            workspace_root,
+            task_dir,
+            args.task_id,
+            args.role,
+            artifact_arguments,
+            legacy_findings=getattr(args, "legacy_findings", False),
+            allow_primary_worktree=args.allow_primary_worktree,
+        )
+        if guard["decision"] != "CONTINUE":
+            raise RalphError(
+                f"{args.role} continuation guard is PAUSED: "
+                + ", ".join(str(value) for value in guard["reasons"])
+            )
     assert_default_git_index_flags(
         workspace_root,
         scopes,
@@ -2514,6 +4234,11 @@ def checkpoint_command(args: argparse.Namespace) -> int:
         validation_phase,
         index if validation_phase == "archived" else None,
         artifact_arguments,
+        **(
+            {"legacy_findings": True}
+            if getattr(args, "legacy_findings", False)
+            else {}
+        ),
     )
     if lifecycle_errors:
         raise RalphError(
@@ -2581,6 +4306,9 @@ def checkpoint_command(args: argparse.Namespace) -> int:
             trailers.append(f"Ralph-Verdict: {verdict}")
     if reviewer_checkpoint is not None:
         trailers.append(f"Ralph-Reviewer: {reviewer_checkpoint}")
+    authorization = authorization_sha256(args.authorization_token)
+    if authorization:
+        trailers.append(f"Ralph-Authorization-SHA256: {authorization}")
     subject = args.message or checkpoint_subject(
         args.role,
         args.task_id,
@@ -2696,6 +4424,11 @@ def handoff_command(args: argparse.Namespace) -> int:
         "archived",
         index,
         args.artifact,
+        **(
+            {"legacy_findings": True}
+            if getattr(args, "legacy_findings", False)
+            else {}
+        ),
     )
     if errors:
         raise RalphError("archived handoff validation failed:\n- " + "\n- ".join(errors))
@@ -2757,6 +4490,23 @@ def handoff_command(args: argparse.Namespace) -> int:
         )
         for item in chain
     ]
+    control_events = [
+        {
+            "commit": item["commit"],
+            "iteration": item["iteration"],
+            "action": item["control_action"],
+            "reasons": item["pause_reasons"],
+            "resume_role": item["resume_role"] or None,
+            "authorization_sha256": item["authorization"] or None,
+            "references": item["references"],
+            "plan_query": item["pq_id"] or None,
+            "plan_decision": item["plan_decision"] or None,
+            "child_task": item["child_task"] or None,
+            "transferred_paths": item["transferred_paths"],
+        }
+        for item in chain
+        if item["role"] == "Control"
+    ]
     changed_paths = sorted(
         nul_paths(
             run_git(
@@ -2791,6 +4541,7 @@ def handoff_command(args: argparse.Namespace) -> int:
                 "deliverables": artifacts,
                 "changed_paths": changed_paths,
                 "commits": commits,
+                "control_events": control_events,
                 "warnings": warnings,
                 "next": (
                     "User manually merges this branch. The plugin will not "
@@ -2942,6 +4693,11 @@ def validate_command(args: argparse.Namespace) -> int:
         args.phase,
         index,
         args.artifact,
+        **(
+            {"legacy_findings": True}
+            if getattr(args, "legacy_findings", False)
+            else {}
+        ),
     )
     result = {
         "phase": args.phase,
@@ -2975,6 +4731,11 @@ def archive_command(args: argparse.Namespace) -> int:
         "accepted",
         None,
         args.artifact,
+        **(
+            {"legacy_findings": True}
+            if getattr(args, "legacy_findings", False)
+            else {}
+        ),
     )
     if errors:
         raise RalphError("task is not accepted:\n- " + "\n- ".join(errors))
@@ -3144,6 +4905,11 @@ def archive_command(args: argparse.Namespace) -> int:
             "archived",
             index,
             args.artifact,
+            **(
+                {"legacy_findings": True}
+                if getattr(args, "legacy_findings", False)
+                else {}
+            ),
         )
         if post_errors:
             raise RalphError(
@@ -3233,6 +4999,60 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot_parser.add_argument("--artifact", action="append", default=[])
     snapshot_parser.set_defaults(handler=snapshot_command)
 
+    guard_parser = subparsers.add_parser(
+        "guard",
+        help="read-only continuation guard using Git numstat and declared metadata",
+    )
+    guard_parser.add_argument("--workspace-root", required=True)
+    guard_parser.add_argument("--task-dir", required=True)
+    guard_parser.add_argument("--task-id", required=True)
+    guard_parser.add_argument(
+        "--role",
+        required=True,
+        choices=("planner-replan", "implementer", "post-review"),
+    )
+    guard_parser.add_argument("--artifact", action="append", default=[])
+    guard_parser.add_argument("--legacy-findings", action="store_true")
+    guard_parser.add_argument("--allow-primary-worktree", action="store_true")
+    guard_parser.set_defaults(handler=guard_command)
+
+    control_parser = subparsers.add_parser(
+        "control",
+        help="append an audited pause, resume, consultation, split, or abandon event",
+    )
+    control_parser.add_argument("--workspace-root", required=True)
+    control_parser.add_argument("--task-dir", required=True)
+    control_parser.add_argument("--task-id", required=True)
+    control_parser.add_argument(
+        "--action",
+        required=True,
+        choices=(
+            "pause",
+            "resume",
+            "plan-query",
+            "plan-response",
+            "split",
+            "abandon",
+        ),
+    )
+    control_parser.add_argument("--reason", action="append", default=[])
+    control_parser.add_argument(
+        "--resume-role",
+        choices=("planner", "implementer"),
+    )
+    control_parser.add_argument("--authorization-token")
+    control_parser.add_argument("--pq-id")
+    control_parser.add_argument(
+        "--decision",
+        choices=tuple(sorted(PLAN_RESPONSE_DECISIONS)),
+    )
+    control_parser.add_argument("--summary")
+    control_parser.add_argument("--reference", action="append", default=[])
+    control_parser.add_argument("--child-task")
+    control_parser.add_argument("--transferred-path", action="append", default=[])
+    control_parser.add_argument("--allow-primary-worktree", action="store_true")
+    control_parser.set_defaults(handler=control_command)
+
     validate_parser = subparsers.add_parser("validate", help="validate a lifecycle phase")
     validate_parser.add_argument("--workspace-root", required=True)
     validate_parser.add_argument("--task-dir", required=True)
@@ -3243,6 +5063,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_parser.add_argument("--index")
     validate_parser.add_argument("--artifact", action="append", default=[])
+    validate_parser.add_argument("--legacy-findings", action="store_true")
     validate_parser.set_defaults(handler=validate_command)
 
     archive_parser = subparsers.add_parser(
@@ -3253,6 +5074,7 @@ def build_parser() -> argparse.ArgumentParser:
     archive_parser.add_argument("--archive-root", required=True)
     archive_parser.add_argument("--index", required=True)
     archive_parser.add_argument("--artifact", action="append", default=[])
+    archive_parser.add_argument("--legacy-findings", action="store_true")
     archive_parser.set_defaults(handler=archive_command)
 
     checkpoint_parser = subparsers.add_parser(
@@ -3283,6 +5105,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
     )
     checkpoint_parser.add_argument("--allow-contract-change", action="store_true")
+    checkpoint_parser.add_argument("--authorization-token")
+    checkpoint_parser.add_argument("--legacy-findings", action="store_true")
     checkpoint_parser.add_argument("--allow-primary-worktree", action="store_true")
     checkpoint_parser.add_argument("--message")
     checkpoint_parser.set_defaults(handler=checkpoint_command)
@@ -3295,6 +5119,7 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_parser.add_argument("--task-dir", required=True)
     handoff_parser.add_argument("--index", required=True)
     handoff_parser.add_argument("--artifact", action="append", default=[])
+    handoff_parser.add_argument("--legacy-findings", action="store_true")
     handoff_parser.add_argument("--allow-primary-worktree", action="store_true")
     handoff_parser.set_defaults(handler=handoff_command)
 

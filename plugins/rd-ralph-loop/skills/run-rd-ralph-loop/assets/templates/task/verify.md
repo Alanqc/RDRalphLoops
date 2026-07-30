@@ -13,6 +13,24 @@
 No review has been recorded. The Reviewer appends one section per iteration and never rewrites
 earlier records.
 
+Every finding has exactly one type:
+
+- `SUBJECT_DEFECT`: the researched or delivered subject is wrong or incomplete.
+- `ASSURANCE_DEFECT`: a harness, test, validator, simulator, or evidence generator is wrong.
+- `CONTRACT_GAP`: the plan or design cannot express a correct implementable path.
+- `EXTERNAL_BLOCKER`: a required asset, device, permission, service, or real observation is absent.
+
+An `ASSURANCE_DEFECT` must include concrete reachability evidence, such as a reproducible false
+pass or unsafe side effect. Its required action is limited to removing or shrinking assurance,
+Reviewer recomputation from immutable evidence, or a minimum local repair within existing
+interfaces. Adding a schema, provider, phase, interface, simulator, or validator layer requires a
+Controller pause and explicit user authorization.
+
+Use exactly one action class: `SUBJECT_FIX`, `SHRINK_ASSURANCE`, `DIRECT_RECOMPUTE`,
+`MINIMAL_LOCAL_FIX`, `REPLAN`, `UNBLOCK_EXTERNAL`, `CLOSE`, or `ESCALATE`. An open
+`ASSURANCE_DEFECT` may use only `SHRINK_ASSURANCE`, `DIRECT_RECOMPUTE`, `MINIMAL_LOCAL_FIX`, or
+`ESCALATE`.
+
 <!--
 ## ITER-001 Review
 
@@ -26,6 +44,10 @@ earlier records.
 | Snapshot SHA-256 | sha256 from scripts/ralph_loop.py snapshot |
 | Verdict | ACCEPTED / CHANGES_REQUIRED / NEEDS_REPLAN / BLOCKED |
 | Residual risk | none, or a concrete risk |
+| Direct subject evidence delta | new immutable or live subject evidence, or NONE |
+| External blocker delta | newly resolved/introduced dependency IDs, or NONE |
+| Assurance surface delta | removed/added harness paths and physical lines, or NONE |
+| Recommended next lifecycle | ARCHIVE / IMPLEMENT / REPLAN / PAUSE_EXTERNAL |
 
 ### AC Decision Matrix
 
@@ -35,9 +57,9 @@ earlier records.
 
 ### Findings
 
-| Finding | ACs | Severity | Status | Evidence | Required action |
-|---|---|---|---|---|---|
-| F-001 | AC-001 | P0 / P1 / P2 / P3 | Open / Closed | path, command, or output | actionable change |
+| Finding | ACs | Type | Severity | Status | Evidence | Action class | Required action |
+|---|---|---|---|---|---|---|---|
+| F-001 | AC-001 | SUBJECT_DEFECT / ASSURANCE_DEFECT / CONTRACT_GAP / EXTERNAL_BLOCKER | P0 / P1 / P2 / P3 | Open / Closed | path, command, output, and reachability when assurance-related | SUBJECT_FIX / SHRINK_ASSURANCE / DIRECT_RECOMPUTE / MINIMAL_LOCAL_FIX / REPLAN / UNBLOCK_EXTERNAL / CLOSE / ESCALATE | bounded actionable change |
 
 ### Commands
 

@@ -6,8 +6,10 @@ description: Orchestrate evidence-gated research and development work as a three
 # Run an R&D Ralph Loop
 
 Use one interactive Controller and three isolated roles: Planner, Implementer, and Reviewer. Make
-the Planner mandatory at initialization and conditional later; run the Implementer and Reviewer in
-every iteration. Treat Reviewer acceptance as the only successful exit.
+the Planner mandatory at initialization and conditional later. Run the Implementer in every
+implementation iteration and an independent Reviewer for every immutable candidate. An
+Implementer plan consultation stays inside the same iteration and creates no candidate or review.
+Treat Reviewer acceptance as the only successful exit.
 
 The Controller owns orchestration, Git state, checkpoints, status updates, and user interaction.
 Role agents edit only their authorized files and never commit, merge, push, rebase, cherry-pick,
@@ -30,6 +32,9 @@ Resolve `<skill-root>` as the directory containing this `SKILL.md`; run bundled 
 - Preserve role dependencies: do not start Implementer before Planner returns, and do not start
   Reviewer before the Implementer checkpoint and snapshot exist. Controller interactivity does not
   authorize concurrent writers in one worktree.
+- Treat pause, resume, abandon, split, plan-query, and plan-response as Controller-owned
+  append-only events. In Git mode, use empty Control checkpoints that leave current WIP unstaged
+  and untouched.
 - Do not send the final response while a required role is still running. Finalize only after
   acceptance, archival, closure checkpoint, and handoff.
 
@@ -66,6 +71,11 @@ directories, databases, ports, caches, devices, and external publication targets
 overlap on any mutable resource, mark the dependency and serialize those Implementer passes or
 pause as `BLOCKED`.
 
+A readiness child task must reference its paused parent, parent Base/candidate, transferred paths,
+returned deliverables, and parent resume predicate. The child has exclusive write ownership of
+transferred paths until handback; the parent stays paused and must not compete for them. A child
+cannot claim the parent's live acceptance.
+
 For a non-Git workspace, skip worktree and checkpoint commands and retain the content-snapshot
 workflow.
 
@@ -98,15 +108,26 @@ four-pack, keep repository-native gates, pass nonstandard deliverables through r
 
 Dispatch a fresh Planner. Require it to complete all four files before implementation:
 
-- `proposal.md`: freeze the goal, scope, non-goals, constraints, and stable `AC-*` criteria.
-- `design.md`: define the approach, interfaces, risks, decisions, exact deliverable paths, owners,
-  formats, retention, and concurrent resource ownership.
+- `proposal.md`: freeze the goal, scope, non-goals, constraints, and stable `AC-*` criteria;
+  register every blocking external dependency and immutable unblock proof plus guarded deliverable
+  path budgets.
+- `design.md`: define the approach, minimum verification boundary, interfaces, risks, decisions,
+  exact deliverable paths, classes, owners, formats, retention, and concurrent resource ownership.
 - `plan.md`: map every `DEL-*` and `ITEM-*` to `AC-*`, include dependencies and executable
   verification methods, and record worktree, branch, base commit, and manual merge mode.
 - `verify.md`: create only the empty review schema. Do not pre-fill evidence or a verdict.
 
 The Planner owns `proposal.md`. A material goal, scope, or AC change requires explicit user
 authorization and a recorded re-baseline; never weaken criteria to fit the implementation.
+Adding a deliverable/path, budget, schema generation, provider, phase, public interface, or
+assurance surface after initialization also requires explicit user authorization. An authorization
+token/reference is a non-secret audit identifier, not an authentication credential.
+
+Guard measurement is intentionally limited to physical line counts and
+`git diff --numstat --no-renames` for proposal-listed deliverable paths. Never add AST, call-graph,
+schema, execution, or semantic validation to the guard itself. Use the CODE/DOCUMENT defaults in
+the proposal template unless the user approves task-specific initialization values. Every
+deliverable must be covered by a guarded prefix or a reasoned `path :: reason` exclusion.
 
 Validate the bundled planning pack, then let the Controller create the checkpoint:
 
@@ -136,13 +157,51 @@ For iteration `N`:
 
 1. Run Planner first only for initialization or a re-entry trigger. After re-entry, checkpoint with
    `--role planner-replan --iteration N`. Add `--allow-contract-change` only after the user
-   explicitly authorizes a proposal/AC re-baseline.
+   explicitly authorizes a proposal/AC re-baseline. Require a disposition for every triggering
+   `F-*`/`PQ-*`, what was removed or replaced, the budget delta, and the next direct subject
+   evidence. New deliverables/paths, budgets, schema generations, providers, phases, interfaces, or
+   assurance layers require explicit user authorization, not merely Controller preference.
+
+   ```bash
+   python3 <skill-root>/scripts/ralph_loop.py guard \
+     --role planner-replan \
+     --workspace-root <worktree> \
+     --task-dir <task-dir> \
+     --task-id <task-id>
+   ```
+
+   Checkpoint the Planner only when the guard returns `CONTINUE`.
 2. Run Implementer. Require it to update deliverables and `plan.md`, run declared checks, and record
    changed paths, commands, results, and unresolved issues. It may amend `design.md` only when
    necessary and must log why. It must not edit `proposal.md` or `verify.md`.
+   - If it discovers an ambiguous, contradictory, infeasible, ownership-breaking, or
+     expansion-requiring plan, stop before candidate creation with `PLAN_FEEDBACK_REQUIRED`.
+     Require a stable `PQ-NNN`, affected `ITEM-*`/`DEL-*`/`AC-*`, whether WIP exists, continue-risk,
+     and a recommendation.
+   - Record a plan-query Control event and dispatch a fresh Planner for read-only consultation.
+     The Planner must answer each query with `ACCEPT`, `MODIFY`, `REJECT`, or `ESCALATE`, plus
+     exactly one outcome: `CLARIFIED`, `REPLAN_REQUIRED`, `CONTRACT_CHANGE_REQUIRED`, or
+     `EXTERNAL_BLOCKER`. Record a plan-response Control event. These events are not Reviewer
+     verdicts.
+   - `CLARIFIED` returns to the same Implementer. A formal `REPLAN_REQUIRED` file edit requires a
+     clean role-scoped tree. Preserve dirty WIP and pause as `PLAN_CONFLICT` rather than stashing,
+     discarding, or letting Planner edit over it. Contract changes pause for user authorization;
+     external blockers pause as `EXTERNAL`.
+   - A second consultation in the same implementation iteration pauses as `PLAN_CONFLICT` before
+     more planning churn is allowed.
 3. After the Implementer returns, inspect all worktree changes and create the immutable candidate:
 
+   First run the Implementer guard. If it returns a pause decision, record an empty Control pause
+   checkpoint, preserve all tracked and untracked WIP unstaged, and do not create a candidate or
+   dispatch Reviewer.
+
    ```bash
+   python3 <skill-root>/scripts/ralph_loop.py guard \
+     --role implementer \
+     --workspace-root <worktree> \
+     --task-dir <task-dir> \
+     --task-id <task-id>
+
    python3 <skill-root>/scripts/ralph_loop.py checkpoint \
      --workspace-root <worktree> \
      --task-dir <task-dir> \
@@ -170,9 +229,18 @@ For iteration `N`:
 5. Run a fresh independent Reviewer. Give it the task pack, declared deliverables, implementation
    evidence, exact candidate commit, branch, and snapshot; never give it a desired verdict.
 6. The Reviewer may inspect files and run checks but may modify only `verify.md`. It appends exactly
-   one review record, maps every finding to `AC-*`, records independently observed evidence,
+   one review record, maps every finding to `AC-*`, classifies it as `SUBJECT_DEFECT`,
+   `ASSURANCE_DEFECT`, `CONTRACT_GAP`, or `EXTERNAL_BLOCKER`, records independently observed
+   evidence, direct subject evidence delta, external blocker delta, assurance surface delta,
    `Candidate commit`, `Candidate branch`, and snapshot, then emits exactly one verdict:
    `ACCEPTED`, `CHANGES_REQUIRED`, `NEEDS_REPLAN`, or `BLOCKED`.
+   `NEEDS_REPLAN` requires an open `CONTRACT_GAP`; `BLOCKED` requires an open
+   `EXTERNAL_BLOCKER` preventing a required AC. An `ASSURANCE_DEFECT` must have a concrete reachable
+   false result or unsafe side effect. Its action is limited to assurance contraction, Reviewer
+   recomputation from immutable evidence, or a minimum local repair within existing interfaces.
+   Record one action class: `SUBJECT_FIX`, `SHRINK_ASSURANCE`, `DIRECT_RECOMPUTE`,
+   `MINIMAL_LOCAL_FIX`, `REPLAN`, `UNBLOCK_EXTERNAL`, `CLOSE`, or `ESCALATE`. Open assurance
+   findings may use only the three assurance-specific classes or `ESCALATE`.
 7. Validate the review before committing it:
 
    ```bash
@@ -195,14 +263,74 @@ For iteration `N`:
 8. Route the verdict:
 
    - `ACCEPTED`: run the accepted gate, close, archive, and hand off.
-   - `CHANGES_REQUIRED`: carry stable finding IDs into the next mandatory Implementer pass.
-   - `NEEDS_REPLAN`: run Planner before the next Implementer.
-   - `BLOCKED`: record the external decision or state change needed and pause.
+   - `BLOCKED`: record an explicit Control pause with reason `EXTERNAL`; never route it
+     mechanically to Planner.
+   - `CHANGES_REQUIRED` or `NEEDS_REPLAN`: run the post-review guard before dispatching another
+     role. `NEEDS_REPLAN` selects Planner only when the guard returns `CONTINUE`;
+     `CHANGES_REQUIRED` otherwise selects Implementer.
 
-Planner re-entry is also mandatory when one finding survives two reviews, two consecutive
-iterations have materially identical changes or failures, an Implementer changes a design
-invariant or public interface, ACs prove ambiguous or contradictory, or three iterations complete.
-At eight iterations, pause for user direction; never relabel exhaustion as acceptance.
+   ```bash
+   python3 <skill-root>/scripts/ralph_loop.py guard \
+     --role post-review \
+     --workspace-root <worktree> \
+     --task-dir <task-dir> \
+     --task-id <task-id>
+   ```
+
+The guard uses a cumulative reason set and pauses on any declared budget limit, an unresolved
+external dependency blocking a required AC, two consecutive `NEEDS_REPLAN` reviews, two consecutive
+reviews whose open P0/P1 findings are at least half `ASSURANCE_DEFECT`, three completed reviews
+without acceptance, an invalid/missing guard or dependency declaration, or an active legacy pack
+whose review schema has not been explicitly retained. Reasons are `EXTERNAL`, `BUDGET`,
+`ASSURANCE`, `REPLAN_STORM`, `USER_CHECKPOINT`, `PLAN_CONFLICT`, `CONFIGURATION_GAP`, and
+`SCHEMA_MIGRATION`.
+
+Every pause/resume is an append-only Controller event. Every resume requires a non-secret user
+authorization token/reference, evidence resolving the selected reasons, and an explicit resume
+role. Reasons may be resolved in separate Control events, but the eventual resume role must be
+legal for the complete pause-reason set. Unresolved reasons remain paused. A new pause revokes any
+older resume grant. An authorized historical/external grant lasts only through the next Reviewer;
+`BUDGET` never bypasses the Implementer candidate guard, while `CONFIGURATION_GAP` and
+`SCHEMA_MIGRATION` can grant Planner entry only and must be corrected before implementation
+continues. Never relabel exhaustion as acceptance, discard WIP, or start Reviewer without an
+immutable candidate.
+
+The user may instead authorize `abandon` as a terminal non-success that retains the
+branch/worktree/WIP, or `split` with a child task ID and transferred paths. Split leaves the parent
+paused and gives the child exclusive ownership; it does not merge automatically.
+
+Record Controller events with the helper. Repeat `--reason` when a pause has more than one cause:
+
+```bash
+python3 <skill-root>/scripts/ralph_loop.py control \
+  --workspace-root <worktree> \
+  --task-dir <task-dir> \
+  --task-id <task-id> \
+  --action pause \
+  --reason BUDGET \
+  --reason ASSURANCE
+
+python3 <skill-root>/scripts/ralph_loop.py control \
+  --workspace-root <worktree> \
+  --task-dir <task-dir> \
+  --task-id <task-id> \
+  --action resume \
+  --reason BUDGET \
+  --authorization-token <non-secret-user-message-or-change-request-id> \
+  --reference <immutable-resolution-evidence> \
+  --resume-role planner
+```
+
+For Implementer feedback, use `--action plan-query --pq-id PQ-NNN --summary ...` plus one repeated
+`--reference <item-or-deliverable-or-ac-id>` per affected ID. Record the fresh Planner response
+with `--action plan-response --pq-id PQ-NNN --decision <decision> --summary ...`. The decision is
+one of `CLARIFIED`, `REPLAN_REQUIRED`, `CONTRACT_CHANGE_REQUIRED`, or `EXTERNAL_BLOCKER`. A
+subsequent resume or contract-changing Planner checkpoint requires the user authorization token;
+diagnosing that a contract change is required does not.
+
+For legacy packs, never rewrite old review blocks to add finding types. Use `--legacy-findings`
+only to inspect/control an existing pack, require typed findings in new reviews, and stop using
+legacy mode once the latest required schema/history has migrated.
 
 ## Accept, archive, and prepare manual merge
 
@@ -256,10 +384,13 @@ After exact archive-ready bytes are accepted:
    ```
 
 The handoff reports base, branch, candidate, closure commit, accepted snapshot, commits, paths,
-deliverables, and checks. It never merges, pushes, rebases, cherry-picks, deletes a worktree, or
-creates an integration queue. Leave the branch and worktree for the user to merge and clean up
-manually. Branch-local index conflicts are resolved by the user. If conflict resolution changes an
-accepted snapshot member, run a new Implementer -> Reviewer pass on the merged bytes.
+deliverables, Control events, and checks. It never merges, pushes, rebases, cherry-picks, deletes a
+worktree, or creates an integration queue. Leave the branch and worktree for the user to merge and
+clean up manually. Branch-local index conflicts are resolved by the user. If conflict resolution
+changes an accepted snapshot member, run a new Implementer -> Reviewer pass on the merged bytes.
+
+Closure is immutable and terminal. Do not reopen or move an archived four-pack after Closure. Any
+post-Closure change starts a new superseding task that references the archived parent.
 
 Use `<skill-root>/scripts/ralph_loop.py archive` only for the bundled marker-managed index. For a
 custom index/archive protocol, perform repository-native closure before the same closure checkpoint
