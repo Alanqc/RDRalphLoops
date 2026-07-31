@@ -53,6 +53,8 @@ candidate-vector fields set to `N/A`.
 - Append-only Control events for pause, resume, plan feedback, abandon, and child-task splits while
   preserving unstaged WIP.
 - Immutable candidate commits and content snapshots for independent review.
+- Explicit external-evidence exclusions bound to committed opaque manifests, without recursively
+  forcing Git-ignored raw evidence into a candidate.
 - Protocol-v3 candidate vectors spanning CONTROL plus registered `REPO-NNN` participants, sealed
   by a final CONTROL commit.
 - Evidence-gated acceptance followed by an explicit user-confirmation gate before four-pack
@@ -72,7 +74,7 @@ all stored under [`plugins/rd-ralph-loop`](plugins/rd-ralph-loop).
 - Python 3.10 or newer.
 - Git with linked-worktree support.
 
-Version `0.3.1` is validated on macOS and uses a POSIX-oriented test suite. Windows support has not
+Version `0.3.2` is validated on macOS and uses a POSIX-oriented test suite. Windows support has not
 yet been verified. Configure a Git author identity before starting a Git-mode loop.
 
 ## Install

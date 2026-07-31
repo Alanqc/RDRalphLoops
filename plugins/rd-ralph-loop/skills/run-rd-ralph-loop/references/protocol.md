@@ -236,6 +236,34 @@ commit authority merely by editing `plan.md` or `design.md`.
 Required, optional, and explicit deliverable paths must not be inside the four-pack directory or be
 an ancestor that contains it.
 
+Directory deliverables are recursively exact by default. The only exception is an explicit row in
+the plan's `External Evidence Exclusions` table:
+
+```markdown
+| ID | Repository | Excluded path | Manifest path | Reason |
+|---|---|---|---|---|
+| `XEV-001` | `REPO-001` | `results/run/raw.pt` | `results/run-manifest.json` | Large raw evidence retained outside Git |
+```
+
+An excluded path names one exact file or directory subtree; glob and negation syntax are invalid.
+It must be a strict descendant of a required directory deliverable and cannot cover another
+required deliverable, its manifest, or the four-pack. The manifest is an implicit required
+EVIDENCE artifact in the same repository: it must be a regular file, be within the registered
+write scope, enter the candidate commit, and match its snapshot bytes. The helper treats manifest
+content as opaque. Its path must be covered by a proposal Guard Budget and cannot use a budget
+exclusion. The Reviewer, not another helper validator, checks its task-specific hashes, locators,
+and external availability.
+
+Excluded bytes may be absent locally. If present, they must be Git-ignored and untracked, and the
+candidate must not contain them. Unlisted directory members retain the ordinary recursive
+trackability rule. Never infer an exclusion from `.gitignore`, an extension, a deliverable class,
+or a Guard Budget exclusion. Adding/widening an `XEV-*` row or changing its repository/manifest
+expands snapshot authority and requires explicit user authorization; deleting or narrowing one is
+a contraction. Use a dedicated evidence prefix when many files share one retention policy rather
+than adding glob semantics. A required directory with exclusions must retain at least one
+non-excluded candidate member. Represent an entirely external output as a required manifest-file
+deliverable instead of an empty logical directory.
+
 Reject any role, archive, or handoff path carrying `assume-unchanged`, `skip-worktree`, or another
 non-default Git index state. After the Implementer commit, compare every current snapshot member
 directly with its candidate-tree blob; a clean-looking worktree is not evidence that the candidate
@@ -522,6 +550,7 @@ The acceptance snapshot contains:
 - `design.md`;
 - `plan.md`;
 - every required deliverable path declared in the standard plan table, namespaced by repository.
+- every manifest named by an `XEV-*` external-evidence exclusion.
 
 It excludes `verify.md` to avoid a self-referential hash when the Reviewer appends evidence. Any
 post-review mutation of a snapshot member invalidates acceptance and requires another review.
@@ -532,6 +561,12 @@ mode, the snapshot uses a new schema that includes the canonical participant com
 repo-qualified entries. Every required deliverable must match the blob/tree in its named candidate
 commit. Reviewer acceptance binds the global content digest to the control candidate and full
 candidate-vector digest through `verify.md` and commit trailers.
+
+When at least one `XEV-*` row exists, snapshot schema `rd-ralph-snapshot-v3` also binds the
+canonical repository, excluded-path, and manifest-path mapping. Directory hashing and Git
+exact-set checks omit only those declared paths while authenticating every manifest. Changing,
+creating, deleting, or reading the omitted raw bytes does not change the snapshot; changing the
+manifest or policy does. A task without `XEV-*` rows keeps its existing v1/v2 snapshot bytes.
 
 For project-specific plan formats, pass each deliverable explicitly to `snapshot` with
 `--artifact <path>`.

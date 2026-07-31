@@ -1,6 +1,6 @@
 {
   "name": "rd-ralph-loop",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Evidence-gated single- or multi-repository Ralph loops with auditable controls.",
   "author": {
     "name": "Alanqc"
@@ -9,13 +9,14 @@
   "interface": {
     "displayName": "R&D Ralph Loop",
     "shortDescription": "Run guarded, checkpointed R&D loops.",
-    "longDescription": "Run interactive Planner, Implementer, and Reviewer loops across a CONTROL workspace and optional participant Git repositories, with typed findings, bounded implementation growth, auditable checkpoints, explicit post-acceptance user confirmation before archival, and a user-controlled manual-merge handoff.",
+    "longDescription": "Run interactive Planner, Implementer, and Reviewer loops across a CONTROL workspace and optional participant Git repositories, with typed findings, manifest-bound external evidence exclusions, bounded implementation growth, auditable checkpoints, explicit post-acceptance user confirmation before archival, and a user-controlled manual-merge handoff.",
     "developerName": "Alanqc",
     "category": "Productivity",
     "capabilities": [
       "Multi-agent orchestration",
       "Git worktree isolation",
       "Multi-repository candidate vectors",
+      "Manifest-bound external evidence",
       "Scoped checkpoint commits",
       "Complexity circuit breakers",
       "Auditable pause and resume",

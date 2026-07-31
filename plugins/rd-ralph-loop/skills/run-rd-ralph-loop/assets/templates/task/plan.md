@@ -46,6 +46,21 @@ roots in this table.
 |---|---|---|---|---|---|---|---|---|
 | `DEL-001` | SUBJECT / ASSURANCE / EVIDENCE | `AC-001` | `CONTROL` / `REPO-001` | `path/to/output` | Yes | `BUD-001` / EXCLUDED | Pending | [[PLANNER: command, review, or artifact identity]] |
 
+## External Evidence Exclusions
+
+Use this optional table only for raw evidence that must remain outside Git. Each `XEV-NNN` row
+binds one repository-relative excluded path or directory subtree to one committed opaque manifest
+in the same repository. The excluded path must be a strict descendant of a required directory
+deliverable, must be Git-ignored and untracked when present, and may be absent locally. Do not use
+globs. The manifest itself is an implicit required EVIDENCE artifact and must enter the candidate.
+Its path must be covered by a proposal Guard Budget, not a budget exclusion. Leave the table with
+no data rows when every deliverable member belongs in Git. The required directory must retain at
+least one non-excluded candidate member; model a fully external output as a manifest-file
+deliverable instead.
+
+| ID | Repository | Excluded path | Manifest path | Reason |
+|---|---|---|---|---|
+
 ## Delivery Items
 
 | Done | ID | Deliverable / ACs | Depends | Owner | Target | Action |

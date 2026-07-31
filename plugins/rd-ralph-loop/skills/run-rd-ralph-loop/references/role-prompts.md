@@ -38,7 +38,10 @@ useful; stop for the exact user decision when authorization is absent. Define th
 verification boundary and classify every retained deliverable as SUBJECT, ASSURANCE, or EVIDENCE
 with repository ID plus repository-relative owner path/format. Declare exclusive ownership of
 repository and external mutable resources. Trace DEL-*/ITEM-* plus executable verification methods
-in plan, including manual multi-repository merge mode. Do not implement deliverables, pre-claim
+in plan, including manual multi-repository merge mode. When raw evidence must stay outside Git,
+declare exact XEV-* paths and same-repository manifest paths; never infer them from `.gitignore`,
+extensions, or Guard Budget exclusions. Put every manifest path under a Guard Budget. Do not
+implement deliverables, pre-claim
 verification, or run Git-mutating commands. Return repository-qualified changed paths, registry
 decisions, ownership conflicts, external blockers, budget choices, and any user decision still
 required. The Controller will inspect and checkpoint changes only in CONTROL for this Planner pass.
@@ -107,7 +110,10 @@ commands, exit codes/results, finding dispositions, and residual issues.
 
 Before adding/removing/replacing a repository, modifying an undeclared repository, expanding a
 registered write scope, expanding a deliverable/path, raising budget, or adding an interface,
-schema, provider, phase, or assurance surface, stop. You may inspect a user-identified repository
+schema, provider, phase, assurance surface, or adding/widening an External Evidence Exclusion or
+changing its repository/manifest, stop. Follow existing XEV-* rows exactly: update the committed
+opaque manifest, never stage excluded raw bytes, and do not treat an unavailable raw object as
+verified. You may inspect a user-identified repository
 read-only to justify the proposal, but must not modify the new scope or include it in a candidate.
 Return PLAN_FEEDBACK_REQUIRED before candidate creation with: stable PQ-NNN; affected
 ITEM-/DEL-/AC- IDs; proposed repository ID/logical identity and scope when applicable; the exact
@@ -180,8 +186,11 @@ EXTERNAL_BLOCKER with UNBLOCK_EXTERNAL and a required AC. An open ASSURANCE_DEFE
 reachable false result/unsafe side effect and may use only SHRINK_ASSURANCE, DIRECT_RECOMPUTE,
 MINIMAL_LOCAL_FIX, or ESCALATE; never prescribe an unbounded new validator. ACCEPTED requires every
 AC to pass and no blocking finding across the entire candidate vector. If accepted, set accepted
-snapshot, accepted CONTROL candidate, and accepted candidate-vector summary fields. Preserve any
-repository Verify schema. In durable Environment/command evidence, replace machine-local roots
+snapshot, accepted CONTROL candidate, and accepted candidate-vector summary fields. An `XEV-*`
+row authenticates only the committed manifest and omission boundary: directly check that manifest
+against the external bytes or locator required by the AC, and use `BLOCKED` when required external
+evidence is unavailable. Preserve any repository Verify schema. In durable Environment/command
+evidence, replace machine-local roots
 with `<CONTROL_WORKTREE>` and `<REPO-NNN_WORKTREE>` while preserving argv structure, exits, and
 relevant output; never persist an absolute participant worktree path. Do not fix issues or run
 Git-mutating commands. Return the verdict and next action; for `ACCEPTED`, the next lifecycle is

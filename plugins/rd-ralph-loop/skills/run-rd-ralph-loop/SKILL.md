@@ -144,7 +144,8 @@ Dispatch a fresh Planner. Require it to complete all four files before implement
   exact deliverable paths, classes, owners, formats, retention, concurrent resource ownership, and
   the immutable Repository Participants registry.
 - `plan.md`: map every `DEL-*` and `ITEM-*` to `AC-*`, include dependencies and executable
-  verification methods, and record worktree, branch, base commit, and manual merge mode.
+  verification methods, record worktree, branch, base commit, and manual merge mode, and declare
+  any external raw evidence through exact `XEV-*` exclusion-to-manifest bindings.
 - `verify.md`: create only the empty review schema. Do not pre-fill evidence or a verdict.
 
 The Planner owns `proposal.md`. A material goal, scope, or AC change requires explicit user
@@ -164,6 +165,19 @@ Guard measurement is intentionally limited to physical line counts and
 schema, execution, or semantic validation to the guard itself. Use the CODE/DOCUMENT defaults in
 the proposal template unless the user approves task-specific initialization values. Every
 deliverable must be covered by a guarded prefix or a reasoned `path :: reason` exclusion.
+
+Guard-budget exclusions affect line counting only. They never exclude bytes from a candidate. For
+raw evidence that must remain outside Git, add an `External Evidence Exclusions` row in `plan.md`
+with a repository-relative excluded path, an opaque manifest path in the same repository, and a
+reason. The excluded path must be a strict descendant of a required directory deliverable; it may
+be absent locally, but when present it must be Git-ignored and untracked. The helper snapshots and
+commits the manifest without interpreting its task-specific schema. Do not use globs, infer
+exclusions from `.gitignore`, file extensions, or deliverable class, or exclude an entire required
+deliverable. Cover every manifest path with a proposal Guard Budget; a budget exclusion is not
+sufficient. Keep at least one non-excluded candidate member in each such required directory;
+represent a fully external output as a manifest-file deliverable. Adding or widening an exclusion
+or changing its manifest is a contract expansion and requires Planner re-entry plus explicit user
+authorization.
 
 Validate the bundled planning pack, then let the Controller create the checkpoint:
 
@@ -279,6 +293,8 @@ For iteration `N`:
    and write-scope expansions require Planner re-entry, not this flag. A declared or explicit
    deliverable may not overlap the four-pack directory. Snapshot members with non-default Git
    index flags are refused, and every candidate-tree blob must match the filesystem bytes exactly.
+   For an initialized `XEV-*` row, leave the excluded raw path untouched by Git and update its
+   declared manifest as planned. An unlisted ignored member still fails the checkpoint.
 4. Reproduce the candidate snapshot from the clean commit:
 
    ```bash
@@ -306,6 +322,9 @@ For iteration `N`:
    findings may use only the three assurance-specific classes or `ESCALATE`. Normalize
    machine-local roots in durable Reviewer environment/command evidence to `<CONTROL_WORKTREE>`
    and `<REPO-NNN_WORKTREE>` without changing argv structure, exit codes, or relevant output.
+   An `XEV-*` row proves only which candidate manifest authenticates omitted raw bytes.
+   Independently validate that manifest against the external evidence or locator required by the
+   AC; unavailable required evidence is `BLOCKED`, never inferred `PASS`.
 7. Validate the review before committing it:
 
    ```bash

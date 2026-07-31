@@ -254,6 +254,34 @@ def plan(
 {rows}"""
 
 
+def external_evidence_plan(
+    run_id: str,
+    worktree: Path,
+    branch: str,
+    base: str,
+    *,
+    implemented: bool,
+) -> str:
+    section = """## External Evidence Exclusions
+
+| ID | Repository | Excluded path | Manifest path | Reason |
+|---|---|---|---|---|
+| `XEV-001` | `CONTROL` | `bundle/external/raw.pt` | `evidence/manifest.json` | Raw tensor evidence is retained externally and hash-bound by the manifest |
+
+"""
+    return (
+        plan(
+            run_id,
+            worktree,
+            branch,
+            base,
+            implemented=implemented,
+        )
+        .replace("output.txt", "bundle")
+        .replace("## Delivery Items\n", section + "## Delivery Items\n", 1)
+    )
+
+
 def empty_verify(run_id: str) -> str:
     return f"""# Example Verify
 
@@ -1925,6 +1953,532 @@ class GitFlowTest(unittest.TestCase):
             self.assertEqual(git(worktree, "rev-parse", "HEAD"), planner_head)
             self.assertEqual(git(worktree, "diff", "--cached", "--name-only"), "")
 
+    def test_directory_deliverable_accepts_manifested_external_evidence(
+        self,
+    ) -> None:
+        task_id = "TASK-EXTERNAL-EVIDENCE"
+        run_id = "RUN-EXTERNAL-EVIDENCE"
+        with git_task_fixture(task_id, run_id) as (worktree, task_dir, base):
+            (task_dir / "proposal.md").write_text(
+                proposal(task_id, run_id).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (task_dir / "design.md").write_text(
+                design(task_id).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (task_dir / "plan.md").write_text(
+                external_evidence_plan(
+                    run_id,
+                    worktree,
+                    f"ralph/{task_id}",
+                    base,
+                    implemented=False,
+                ),
+                encoding="utf-8",
+            )
+            planner_checkpoint(worktree, task_dir, task_id)
+
+            exclude = git_exclude_path(worktree)
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8")
+                + "\nbundle/external/*.pt\n",
+                encoding="utf-8",
+            )
+            (worktree / "bundle").mkdir()
+            (worktree / "bundle" / "result.txt").write_text(
+                "done\n",
+                encoding="utf-8",
+            )
+            (worktree / "bundle" / "external").mkdir()
+            raw_evidence = worktree / "bundle" / "external" / "raw.pt"
+            raw_evidence.write_bytes(b"raw tensor v1")
+            (worktree / "evidence").mkdir()
+            manifest = worktree / "evidence" / "manifest.json"
+            manifest.write_text(
+                '{"files":{"bundle/external/raw.pt":"fixture-sha256"}}\n',
+                encoding="utf-8",
+            )
+            (task_dir / "plan.md").write_text(
+                external_evidence_plan(
+                    run_id,
+                    worktree,
+                    f"ralph/{task_id}",
+                    base,
+                    implemented=True,
+                ),
+                encoding="utf-8",
+            )
+
+            snapshot_with_raw = json.loads(
+                cli(
+                    "snapshot",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                ).stdout
+            )
+            hidden_artifact = cli(
+                "snapshot",
+                "--workspace-root",
+                str(worktree),
+                "--task-dir",
+                str(task_dir),
+                "--artifact",
+                "bundle/external/raw.pt",
+                expected=2,
+            )
+            self.assertIn(
+                "external-evidence exclusions must not hide snapshot artifacts",
+                hidden_artifact.stderr,
+            )
+            raw_evidence.write_bytes(b"raw tensor v2")
+            snapshot_with_changed_raw = json.loads(
+                cli(
+                    "snapshot",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                ).stdout
+            )
+            raw_evidence.unlink()
+            raw_evidence.parent.rmdir()
+            snapshot_without_raw = json.loads(
+                cli(
+                    "snapshot",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                ).stdout
+            )
+            self.assertEqual(
+                snapshot_with_raw["snapshot_sha256"],
+                snapshot_with_changed_raw["snapshot_sha256"],
+            )
+            self.assertEqual(
+                snapshot_with_raw["snapshot_sha256"],
+                snapshot_without_raw["snapshot_sha256"],
+            )
+            self.assertEqual(
+                snapshot_with_raw["schema"],
+                "rd-ralph-snapshot-v3",
+            )
+
+            original_manifest = manifest.read_text(encoding="utf-8")
+            manifest.write_text(
+                '{"files":{"bundle/external/raw.pt":"changed-sha256"}}\n',
+                encoding="utf-8",
+            )
+            changed_manifest_snapshot = json.loads(
+                cli(
+                    "snapshot",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                ).stdout
+            )
+            self.assertNotEqual(
+                snapshot_with_raw["snapshot_sha256"],
+                changed_manifest_snapshot["snapshot_sha256"],
+            )
+            manifest.write_text(original_manifest, encoding="utf-8")
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8").replace(
+                    "\nbundle/external/*.pt\n",
+                    "\n",
+                ),
+                encoding="utf-8",
+            )
+
+            checkpoint = json.loads(
+                task_cli(
+                    "checkpoint",
+                    worktree,
+                    task_dir,
+                    task_id,
+                    "--role",
+                    "implementer",
+                    "--iteration",
+                    "1",
+                ).stdout
+            )
+            candidate_paths = set(
+                git(
+                    worktree,
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    checkpoint["commit"],
+                ).splitlines()
+            )
+            self.assertIn("bundle/result.txt", candidate_paths)
+            self.assertIn("evidence/manifest.json", candidate_paths)
+            self.assertNotIn("bundle/external/raw.pt", candidate_paths)
+            self.assertFalse(raw_evidence.exists())
+            self.assertEqual(git(worktree, "status", "--porcelain"), "")
+            (task_dir / "verify.md").write_text(
+                accepted_verify(
+                    run_id,
+                    checkpoint["commit"],
+                    f"ralph/{task_id}",
+                    checkpoint["snapshot_sha256"],
+                ),
+                encoding="utf-8",
+            )
+            reviewed = json.loads(
+                cli(
+                    "validate",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                    "--phase",
+                    "reviewed",
+                ).stdout
+            )
+            self.assertTrue(reviewed["valid"], reviewed["errors"])
+            manifest.write_text(
+                '{"files":{"bundle/external/raw.pt":"tampered"}}\n',
+                encoding="utf-8",
+            )
+            tampered_snapshot = json.loads(
+                cli(
+                    "snapshot",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                ).stdout
+            )["snapshot_sha256"]
+            (task_dir / "verify.md").write_text(
+                accepted_verify(
+                    run_id,
+                    checkpoint["commit"],
+                    f"ralph/{task_id}",
+                    tampered_snapshot,
+                ),
+                encoding="utf-8",
+            )
+            tampered = json.loads(
+                cli(
+                    "validate",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                    "--phase",
+                    "reviewed",
+                    expected=1,
+                ).stdout
+            )
+            self.assertFalse(tampered["valid"])
+            self.assertTrue(
+                any(
+                    "candidate trailer" in error.casefold()
+                    or "recorded commit" in error.casefold()
+                    for error in tampered["errors"]
+                ),
+                tampered["errors"],
+            )
+
+    def test_legacy_directory_snapshot_keeps_global_member_order(self) -> None:
+        task_id = "TASK-LEGACY-DIRECTORY-ORDER"
+        run_id = "RUN-LEGACY-DIRECTORY-ORDER"
+        with git_task_fixture(task_id, run_id) as (worktree, task_dir, base):
+            (task_dir / "proposal.md").write_text(
+                proposal(task_id, run_id).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (task_dir / "design.md").write_text(
+                design(task_id).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (task_dir / "plan.md").write_text(
+                plan(
+                    run_id,
+                    worktree,
+                    f"ralph/{task_id}",
+                    base,
+                    implemented=False,
+                ).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (worktree / "bundle" / "a").mkdir(parents=True)
+            nested = worktree / "bundle" / "a" / "x.txt"
+            sibling = worktree / "bundle" / "a-"
+            nested.write_text("nested\n", encoding="utf-8")
+            sibling.write_text("sibling\n", encoding="utf-8")
+
+            snapshot = json.loads(
+                cli(
+                    "snapshot",
+                    "--workspace-root",
+                    str(worktree),
+                    "--task-dir",
+                    str(task_dir),
+                ).stdout
+            )
+            entry = next(
+                item for item in snapshot["entries"] if item["path"] == "bundle"
+            )
+            members = [
+                {"path": "a", "type": "directory"},
+                {
+                    "path": "a-",
+                    "type": "file",
+                    "sha256": hashlib.sha256(sibling.read_bytes()).hexdigest(),
+                    "size": sibling.stat().st_size,
+                },
+                {
+                    "path": "a/x.txt",
+                    "type": "file",
+                    "sha256": hashlib.sha256(nested.read_bytes()).hexdigest(),
+                    "size": nested.stat().st_size,
+                },
+            ]
+            expected_hash = hashlib.sha256(
+                json.dumps(
+                    members,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(snapshot["schema"], "rd-ralph-snapshot-v1")
+            self.assertEqual(entry["sha256"], expected_hash)
+
+    def test_external_evidence_can_remove_a_previously_tracked_raw_file(
+        self,
+    ) -> None:
+        task_id = "TASK-EXTERNAL-MIGRATION"
+        run_id = "RUN-EXTERNAL-MIGRATION"
+        with git_task_fixture(task_id, run_id) as (worktree, task_dir, _):
+            tracked_raw = worktree / "bundle" / "external" / "raw.pt"
+            tracked_raw.parent.mkdir(parents=True)
+            tracked_raw.write_bytes(b"legacy tracked raw")
+            git(worktree, "add", "bundle/external/raw.pt")
+            git(worktree, "commit", "-m", "fixture tracked evidence base")
+            base = git(worktree, "rev-parse", "HEAD")
+            (task_dir / "proposal.md").write_text(
+                proposal(task_id, run_id).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (task_dir / "design.md").write_text(
+                design(task_id).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (task_dir / "plan.md").write_text(
+                external_evidence_plan(
+                    run_id,
+                    worktree,
+                    f"ralph/{task_id}",
+                    base,
+                    implemented=False,
+                ),
+                encoding="utf-8",
+            )
+            planner_checkpoint(worktree, task_dir, task_id)
+
+            tracked_raw.unlink()
+            (worktree / "bundle" / "result.txt").write_text(
+                "done\n",
+                encoding="utf-8",
+            )
+            (worktree / "evidence").mkdir()
+            (worktree / "evidence" / "manifest.json").write_text(
+                '{"files":{"bundle/external/raw.pt":"legacy-sha256"}}\n',
+                encoding="utf-8",
+            )
+            (task_dir / "plan.md").write_text(
+                external_evidence_plan(
+                    run_id,
+                    worktree,
+                    f"ralph/{task_id}",
+                    base,
+                    implemented=True,
+                ),
+                encoding="utf-8",
+            )
+            checkpoint = json.loads(
+                task_cli(
+                    "checkpoint",
+                    worktree,
+                    task_dir,
+                    task_id,
+                    "--role",
+                    "implementer",
+                    "--iteration",
+                    "1",
+                ).stdout
+            )
+            candidate_paths = set(
+                git(
+                    worktree,
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    checkpoint["commit"],
+                ).splitlines()
+            )
+            self.assertNotIn("bundle/external/raw.pt", candidate_paths)
+            self.assertIn("bundle/result.txt", candidate_paths)
+            self.assertIn("evidence/manifest.json", candidate_paths)
+            self.assertEqual(git(worktree, "status", "--porcelain"), "")
+
+    def test_external_evidence_exclusion_does_not_hide_unlisted_ignored_file(
+        self,
+    ) -> None:
+        task_id = "TASK-EXTERNAL-BOUNDARY"
+        run_id = "RUN-EXTERNAL-BOUNDARY"
+        with git_task_fixture(task_id, run_id) as (worktree, task_dir, base):
+            (task_dir / "proposal.md").write_text(
+                proposal(task_id, run_id).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (task_dir / "design.md").write_text(
+                design(task_id).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (task_dir / "plan.md").write_text(
+                external_evidence_plan(
+                    run_id,
+                    worktree,
+                    f"ralph/{task_id}",
+                    base,
+                    implemented=False,
+                ),
+                encoding="utf-8",
+            )
+            planner_checkpoint(worktree, task_dir, task_id)
+            planner_head = git(worktree, "rev-parse", "HEAD")
+
+            exclude = git_exclude_path(worktree)
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8")
+                + "\nbundle/external/*.pt\n",
+                encoding="utf-8",
+            )
+            (worktree / "bundle").mkdir()
+            (worktree / "bundle" / "result.txt").write_text(
+                "done\n",
+                encoding="utf-8",
+            )
+            (worktree / "bundle" / "external").mkdir()
+            (worktree / "bundle" / "external" / "raw.pt").write_bytes(b"listed")
+            (worktree / "bundle" / "external" / "unlisted.pt").write_bytes(
+                b"unlisted"
+            )
+            (worktree / "evidence").mkdir()
+            (worktree / "evidence" / "manifest.json").write_text(
+                '{"files":{"bundle/external/raw.pt":"fixture-sha256"}}\n',
+                encoding="utf-8",
+            )
+            (task_dir / "plan.md").write_text(
+                external_evidence_plan(
+                    run_id,
+                    worktree,
+                    f"ralph/{task_id}",
+                    base,
+                    implemented=True,
+                ),
+                encoding="utf-8",
+            )
+
+            result = task_cli(
+                "checkpoint",
+                worktree,
+                task_dir,
+                task_id,
+                "--role",
+                "implementer",
+                "--iteration",
+                "1",
+                expected=2,
+            )
+            self.assertIn("bundle/external/unlisted.pt", result.stderr)
+            self.assertIn("unavailable to the candidate commit", result.stderr)
+            self.assertEqual(git(worktree, "rev-parse", "HEAD"), planner_head)
+            self.assertEqual(git(worktree, "diff", "--cached", "--name-only"), "")
+
+    def test_implementer_cannot_add_external_evidence_exclusion_without_authority(
+        self,
+    ) -> None:
+        task_id = "TASK-EXTERNAL-AUTHORITY"
+        run_id = "RUN-EXTERNAL-AUTHORITY"
+        with git_task_fixture(task_id, run_id) as (worktree, task_dir, base):
+            (task_dir / "proposal.md").write_text(
+                proposal(task_id, run_id).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (task_dir / "design.md").write_text(
+                design(task_id).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            (task_dir / "plan.md").write_text(
+                plan(
+                    run_id,
+                    worktree,
+                    f"ralph/{task_id}",
+                    base,
+                    implemented=False,
+                ).replace("output.txt", "bundle"),
+                encoding="utf-8",
+            )
+            planner_checkpoint(worktree, task_dir, task_id)
+            planner_head = git(worktree, "rev-parse", "HEAD")
+
+            exclude = git_exclude_path(worktree)
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8")
+                + "\nbundle/external/*.pt\n",
+                encoding="utf-8",
+            )
+            (worktree / "bundle").mkdir()
+            (worktree / "bundle" / "result.txt").write_text(
+                "done\n",
+                encoding="utf-8",
+            )
+            (worktree / "bundle" / "external").mkdir()
+            (worktree / "bundle" / "external" / "raw.pt").write_bytes(
+                b"external"
+            )
+            (worktree / "evidence").mkdir()
+            (worktree / "evidence" / "manifest.json").write_text(
+                '{"files":{"bundle/external/raw.pt":"fixture-sha256"}}\n',
+                encoding="utf-8",
+            )
+            (task_dir / "plan.md").write_text(
+                external_evidence_plan(
+                    run_id,
+                    worktree,
+                    f"ralph/{task_id}",
+                    base,
+                    implemented=True,
+                ),
+                encoding="utf-8",
+            )
+            result = task_cli(
+                "checkpoint",
+                worktree,
+                task_dir,
+                task_id,
+                "--role",
+                "implementer",
+                "--iteration",
+                "1",
+                expected=2,
+            )
+            self.assertIn(
+                "expanded External Evidence Exclusions; route through "
+                "an authorized Planner checkpoint",
+                result.stderr,
+            )
+            self.assertEqual(git(worktree, "rev-parse", "HEAD"), planner_head)
+            self.assertEqual(git(worktree, "diff", "--cached", "--name-only"), "")
+
     def test_git_context_rejects_primary_worktree_for_loop(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ralph-primary-") as raw:
             repo = Path(raw)
@@ -2023,6 +2577,266 @@ class ProtocolV3RepositoryMappingTest(unittest.TestCase):
             "--index",
             "tasks/index.md",
         )
+
+    def test_participant_external_evidence_is_manifested_and_repository_scoped(
+        self,
+    ) -> None:
+        task_id = "TASK-V3-EXTERNAL"
+        run_id = "RUN-V3-EXTERNAL"
+        with git_v3_repository_fixture(task_id, run_id) as (
+            control,
+            repo_1,
+            repo_2,
+            _,
+            task_dir,
+            _,
+            repo_1_base,
+            repo_2_base,
+        ):
+            proposal_path = task_dir / "proposal.md"
+            proposal_path.write_text(
+                proposal_path.read_text(encoding="utf-8").replace(
+                    "| `BUD-001` | `REPO-001` | CODE | `artifact/output.txt` |",
+                    "| `BUD-001` | `REPO-001` | CODE | `artifact` |",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            design_path = task_dir / "design.md"
+            design_path.write_text(
+                design_path.read_text(encoding="utf-8").replace(
+                    "| `DEL-001` | SUBJECT | `REPO-001` | `artifact/output.txt` |",
+                    "| `DEL-001` | SUBJECT | `REPO-001` | `artifact` |",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            plan_path = task_dir / "plan.md"
+            external_section = """## External Evidence Exclusions
+
+| ID | Repository | Excluded path | Manifest path | Reason |
+|---|---|---|---|---|
+| `XEV-001` | `REPO-001` | `artifact/raw.pt` | `artifact/manifest.json` | Raw tensor bytes are retained externally and hash-bound by the manifest |
+
+"""
+            plan_path.write_text(
+                plan_path.read_text(encoding="utf-8")
+                .replace(
+                    "| `DEL-001` | SUBJECT | `AC-001` | `REPO-001` | "
+                    "`artifact/output.txt` |",
+                    "| `DEL-001` | SUBJECT | `AC-001` | `REPO-001` | "
+                    "`artifact` |",
+                    1,
+                )
+                .replace(
+                    "## Delivery Items\n",
+                    external_section + "## Delivery Items\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            proposal_text = proposal_path.read_text(encoding="utf-8")
+            proposal_path.write_text(
+                proposal_text.replace(
+                    "| `BUD-001` | `REPO-001` | CODE | `artifact` | 3000 | "
+                    "5000 | 12000 | 6000 | N/A | Initial task request |",
+                    "| `BUD-001` | `REPO-001` | CODE | `artifact` | 3000 | "
+                    "5000 | 12000 | 6000 | `artifact/manifest.json :: exempt` | "
+                    "Initial task request |",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            excluded_manifest = json.loads(
+                self._command(
+                    "validate",
+                    control,
+                    task_dir,
+                    repo_1,
+                    repo_2,
+                    "--phase",
+                    "planned",
+                    expected=1,
+                ).stdout
+            )
+            self.assertTrue(
+                any(
+                    "external-evidence manifest" in error
+                    and "budget exclusion" in error
+                    for error in excluded_manifest["errors"]
+                ),
+                excluded_manifest["errors"],
+            )
+            proposal_path.write_text(proposal_text, encoding="utf-8")
+            self._planner_checkpoint(
+                control,
+                task_dir,
+                task_id,
+                repo_1,
+                repo_2,
+            )
+
+            exclude = git_exclude_path(repo_1)
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\nartifact/*.pt\n",
+                encoding="utf-8",
+            )
+            raw_evidence = repo_1 / "artifact/raw.pt"
+            raw_evidence.write_bytes(b"participant raw evidence")
+            manifest = repo_1 / "artifact/manifest.json"
+            manifest.write_text(
+                '{"files":{"artifact/raw.pt":"fixture-sha256"}}\n',
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                implemented_plan_v3(plan_path.read_text(encoding="utf-8")),
+                encoding="utf-8",
+            )
+
+            prepared = self._json(
+                "participant-checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--repo-id",
+                "REPO-001",
+                "--iteration",
+                "1",
+            )
+            self.assertEqual(prepared["status"], "prepared")
+            candidate_paths = set(
+                git(
+                    repo_1,
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    str(prepared["commit"]),
+                ).splitlines()
+            )
+            self.assertIn("artifact/manifest.json", candidate_paths)
+            self.assertIn("artifact/output.txt", candidate_paths)
+            self.assertNotIn("artifact/raw.pt", candidate_paths)
+
+            carried = self._json(
+                "participant-checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--repo-id",
+                "REPO-002",
+                "--iteration",
+                "1",
+            )
+            self.assertEqual(carried["commit"], repo_2_base)
+            seal = self._json(
+                "checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--role",
+                "implementer",
+                "--iteration",
+                "1",
+            )
+            snapshot = self._json(
+                "snapshot",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+            )
+            self.assertEqual(snapshot["schema"], "rd-ralph-snapshot-v3")
+            self.assertEqual(
+                snapshot["external_evidence"],
+                [
+                    {
+                        "repository": "REPO-001",
+                        "excluded_path": "artifact/raw.pt",
+                        "manifest_path": "artifact/manifest.json",
+                    }
+                ],
+            )
+            self.assertEqual(
+                snapshot["participant_commits"]["REPO-001"],
+                prepared["commit"],
+            )
+            self.assertEqual(
+                snapshot["participant_commits"]["REPO-002"],
+                repo_2_base,
+            )
+            self.assertEqual(seal["snapshot_sha256"], snapshot["snapshot_sha256"])
+            verify_text = accepted_verify_v3(
+                    run_id,
+                    str(seal["commit"]),
+                    f"ralph/{task_id}",
+                    str(snapshot["snapshot_sha256"]),
+                    str(seal["candidate_vector_sha256"]),
+                    {
+                        "REPO-001": (
+                            repo_1_base,
+                            str(prepared["commit"]),
+                        ),
+                        "REPO-002": (repo_2_base, repo_2_base),
+                    },
+                )
+            verify_text = verify_text.replace(
+                f"| REPO-002 | participant-two | `ralph/{task_id}` | "
+                f"`{repo_2_base}` | `{repo_2_base}` | Yes |",
+                f"| REPO-002 | participant-two | `ralph/{task_id}` | "
+                f"`{repo_2_base}` | `{repo_2_base}` | No |",
+                1,
+            )
+            (task_dir / "verify.md").write_text(
+                verify_text,
+                encoding="utf-8",
+            )
+            reviewed = self._json(
+                "validate",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--phase",
+                "reviewed",
+            )
+            self.assertTrue(reviewed["valid"], reviewed["errors"])
+            reviewer = self._json(
+                "checkpoint",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+                "--task-id",
+                task_id,
+                "--role",
+                "reviewer",
+                "--iteration",
+                "1",
+            )
+            self.assertEqual(reviewer["role"], "Reviewer")
+            raw_evidence.write_bytes(b"changed ignored participant evidence")
+            changed_raw_snapshot = self._json(
+                "snapshot",
+                control,
+                task_dir,
+                repo_1,
+                repo_2,
+            )
+            self.assertEqual(
+                snapshot["snapshot_sha256"],
+                changed_raw_snapshot["snapshot_sha256"],
+            )
+            for root in (control, repo_1, repo_2):
+                self.assertEqual(git(root, "status", "--porcelain"), "")
 
     def test_unchanged_participant_carries_base_into_control_seal(self) -> None:
         task_id = "TASK-V3-CARRY"

@@ -131,6 +131,36 @@ class RepositoryPath:
         self.path = path
 
 
+class ExternalEvidenceExclusion:
+    __slots__ = (
+        "identifier",
+        "repository",
+        "excluded_relative",
+        "excluded_path",
+        "manifest_relative",
+        "manifest_path",
+        "reason",
+    )
+
+    def __init__(
+        self,
+        identifier: str,
+        repository: str,
+        excluded_relative: str,
+        excluded_path: Path,
+        manifest_relative: str,
+        manifest_path: Path,
+        reason: str,
+    ) -> None:
+        self.identifier = identifier
+        self.repository = repository
+        self.excluded_relative = excluded_relative
+        self.excluded_path = excluded_path
+        self.manifest_relative = manifest_relative
+        self.manifest_path = manifest_path
+        self.reason = reason
+
+
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -1752,12 +1782,90 @@ def snapshot_git_paths(
     return sorted(set(paths))
 
 
+def path_matches_exclusion(
+    relative: str,
+    exclusions: Iterable[str],
+) -> bool:
+    normalized = Path(relative).as_posix().strip("/")
+    return any(
+        normalized == excluded
+        or normalized.startswith(excluded + "/")
+        for excluded in (
+            Path(value).as_posix().strip("/")
+            for value in exclusions
+        )
+    )
+
+
+def snapshot_tree_members(
+    path: Path,
+    exclusions: Iterable[Path] = (),
+) -> list[Path]:
+    excluded = tuple(exclusions)
+    members: list[Path] = []
+
+    def excluded_path(candidate: Path) -> bool:
+        return any(
+            candidate == root or root in candidate.parents
+            for root in excluded
+        )
+
+    def visit(directory: Path) -> None:
+        try:
+            children = sorted(
+                directory.iterdir(),
+                key=lambda item: item.name,
+            )
+        except OSError as exc:
+            raise RalphError(
+                f"cannot enumerate snapshot directory {directory}: {exc}"
+            ) from exc
+        for member in children:
+            if excluded_path(member):
+                continue
+            members.append(member)
+            if member.is_dir() and not member.is_symlink():
+                visit(member)
+
+    visit(path)
+    if excluded:
+        included_leaves = [
+            member
+            for member in members
+            if member.is_symlink() or member.is_file()
+        ]
+        members = [
+            member
+            for member in members
+            if not (
+                member.is_dir()
+                and not member.is_symlink()
+                and any(
+                    member == root or member in root.parents
+                    for root in excluded
+                )
+                and not any(
+                    member in leaf.parents
+                    for leaf in included_leaves
+                )
+            )
+        ]
+    return sorted(
+        members,
+        key=lambda item: item.relative_to(path).as_posix(),
+    )
+
+
 def current_files_for_git_paths(
     workspace_root: Path,
     paths: Iterable[str],
+    exclusions: Iterable[str] = (),
 ) -> set[str]:
+    excluded = tuple(sorted(set(exclusions)))
     files: set[str] = set()
     for relative in sorted(set(paths)):
+        if path_matches_exclusion(relative, excluded):
+            continue
         path = workspace_root / relative
         if path.is_symlink() or path.is_file():
             files.add(relative)
@@ -1766,7 +1874,14 @@ def current_files_for_git_paths(
             continue
         if not path.is_dir():
             raise RalphError(f"snapshot path has unsupported file type: {relative}")
-        all_members = list(path.rglob("*"))
+        all_members = snapshot_tree_members(
+            path,
+            (
+                workspace_root / value
+                for value in excluded
+                if value.startswith(relative.rstrip("/") + "/")
+            ),
+        )
         unsupported = [
             member
             for member in all_members
@@ -1789,6 +1904,7 @@ def current_files_for_git_paths(
             for member in all_members
             if member.is_symlink() or member.is_file()
         ]
+        member_paths = set(members)
         empty_directories = [
             directory
             for directory in [
@@ -1800,8 +1916,8 @@ def current_files_for_git_paths(
                 ),
             ]
             if not any(
-                child.is_symlink() or child.is_file()
-                for child in directory.rglob("*")
+                member == directory or directory in member.parents
+                for member in member_paths
             )
         ]
         if empty_directories:
@@ -1824,9 +1940,16 @@ def current_snapshot_files(
     workspace_root: Path,
     explicit_artifacts: Iterable[str],
 ) -> set[str]:
+    plan = read_text(task_dir / "plan.md")
+    roots = {CONTROL_REPOSITORY_ID: workspace_root.resolve(strict=True)}
+    exclusions = [
+        policy.excluded_relative
+        for policy in external_evidence_exclusions(plan, roots)
+    ]
     return current_files_for_git_paths(
         workspace_root,
         snapshot_git_paths(task_dir, workspace_root, explicit_artifacts),
+        exclusions,
     )
 
 
@@ -1870,11 +1993,14 @@ def assert_repository_paths_trackable_before_commit(
     changed_paths: set[str],
     *,
     label: str = "snapshot",
+    exclusions: Iterable[str] = (),
 ) -> None:
     scopes = sorted(set(paths))
+    excluded = sorted(set(exclusions))
     expected_files = current_files_for_git_paths(
         workspace_root,
         scopes,
+        excluded,
     )
     tracked_files = nul_paths(
         run_git(
@@ -1893,6 +2019,59 @@ def assert_repository_paths_trackable_before_commit(
         scopes,
         label=f"{label} members",
     )
+    tracked_excluded = sorted(
+        path
+        for path in tracked_files
+        if path_matches_exclusion(path, excluded)
+    )
+    permitted_deletions = {
+        path
+        for path in changed_paths
+        if (
+            path_matches_exclusion(path, excluded)
+            and not (workspace_root / path).exists()
+            and not (workspace_root / path).is_symlink()
+        )
+    }
+    tracked_excluded = sorted(
+        set(tracked_excluded) - permitted_deletions
+    )
+    if tracked_excluded:
+        raise RalphError(
+            f"{label} external-evidence exclusions contain tracked files: "
+            + ", ".join(tracked_excluded)
+        )
+    changed_excluded = sorted(
+        path
+        for path in changed_paths
+        if path_matches_exclusion(path, excluded)
+        and path not in permitted_deletions
+    )
+    if changed_excluded:
+        raise RalphError(
+            f"{label} external-evidence exclusions must remain Git-ignored "
+            "and untracked: "
+            + ", ".join(changed_excluded)
+        )
+    unignored = [
+        path
+        for path in excluded
+        if (
+            (workspace_root / path).exists()
+            or (workspace_root / path).is_symlink()
+        )
+        and run_git(
+            workspace_root,
+            ["check-ignore", "--no-index", "--quiet", "--", path],
+            check=False,
+        ).returncode
+        != 0
+    ]
+    if unignored:
+        raise RalphError(
+            f"{label} external-evidence exclusions are not Git-ignored: "
+            + ", ".join(unignored)
+        )
     unavailable = sorted(expected_files - tracked_files - changed_paths)
     if unavailable:
         destination = (
@@ -1913,10 +2092,21 @@ def assert_snapshot_trackable_before_commit(
     explicit_artifacts: Iterable[str],
     changed_paths: set[str],
 ) -> None:
+    plan = read_text(task_dir / "plan.md")
+    roots = {CONTROL_REPOSITORY_ID: workspace_root.resolve(strict=True)}
+    policies = external_evidence_exclusions(plan, roots)
+    assert_external_evidence_manifests_ready(
+        policies,
+        label="snapshot",
+    )
     assert_repository_paths_trackable_before_commit(
         workspace_root,
         snapshot_git_paths(task_dir, workspace_root, explicit_artifacts),
         changed_paths,
+        exclusions=[
+            policy.excluded_relative
+            for policy in policies
+        ],
     )
 
 
@@ -1926,13 +2116,16 @@ def assert_repository_paths_match_commit(
     commit: str,
     *,
     label: str = "snapshot",
+    exclusions: Iterable[str] = (),
 ) -> None:
     path_list = sorted(set(paths))
     if not path_list:
         return
+    excluded = sorted(set(exclusions))
     expected_files = current_files_for_git_paths(
         workspace_root,
         path_list,
+        excluded,
     )
     tracked_files = nul_paths(
         run_git(
@@ -2034,11 +2227,16 @@ def assert_staged_paths_match_worktree(
     paths: Iterable[str],
     *,
     label: str,
+    exclusions: Iterable[str] = (),
 ) -> None:
     path_list = sorted(set(paths))
     if not path_list:
         return
-    expected_files = current_files_for_git_paths(workspace_root, path_list)
+    expected_files = current_files_for_git_paths(
+        workspace_root,
+        path_list,
+        exclusions,
+    )
     staged_files = nul_paths(
         run_git(
             workspace_root,
@@ -2112,10 +2310,16 @@ def assert_snapshot_matches_commit(
     explicit_artifacts: Iterable[str],
     commit: str,
 ) -> None:
+    plan = read_text(task_dir / "plan.md")
+    roots = {CONTROL_REPOSITORY_ID: workspace_root.resolve(strict=True)}
     assert_repository_paths_match_commit(
         workspace_root,
         snapshot_git_paths(task_dir, workspace_root, explicit_artifacts),
         commit,
+        exclusions=[
+            policy.excluded_relative
+            for policy in external_evidence_exclusions(plan, roots)
+        ],
     )
 
 
@@ -2241,6 +2445,272 @@ def required_deliverables(plan: str) -> list[dict[str, str]]:
         for item in parse_deliverables(plan)
         if item["required"].strip().casefold() not in false_values
     ]
+
+
+def external_evidence_exclusions(
+    plan: str,
+    repositories: dict[str, Path],
+) -> list[ExternalEvidenceExclusion]:
+    section = markdown_section(plan, "External Evidence Exclusions")
+    if not section.strip():
+        return []
+    rows = markdown_rows(section)
+    if not rows:
+        raise RalphError(
+            "External Evidence Exclusions section has no Markdown table"
+        )
+    header = [cell.casefold() for cell in rows[0]]
+    aliases = {
+        "id": {"id", "exclusion", "exclusion id"},
+        "repository": {"repository", "repo", "repository id"},
+        "excluded": {"excluded path", "exclude", "path"},
+        "manifest": {"manifest path", "manifest"},
+        "reason": {"reason", "rationale"},
+    }
+    columns: dict[str, int] = {}
+    for key, names in aliases.items():
+        for index, value in enumerate(header):
+            if value in names:
+                columns[key] = index
+                break
+    if set(columns) != set(aliases):
+        raise RalphError(
+            "External Evidence Exclusions table requires ID, Repository, "
+            "Excluded path, Manifest path, and Reason columns"
+        )
+
+    parsed: list[ExternalEvidenceExclusion] = []
+    identifiers: set[str] = set()
+    exclusion_keys: set[tuple[str, str]] = set()
+    for row in rows[1:]:
+        if len(row) <= max(columns.values()):
+            raise RalphError(
+                "External Evidence Exclusions table contains a short row"
+            )
+        identifier = row[columns["id"]].strip()
+        if identifier.casefold() in {"", "n/a", "na", "none", "-"}:
+            if all(
+                row[columns[key]].strip().casefold()
+                in {"", "n/a", "na", "none", "-"}
+                for key in aliases
+            ):
+                continue
+            raise RalphError(
+                "External Evidence Exclusions row has no XEV-NNN ID"
+            )
+        if not re.fullmatch(r"XEV-\d{3,}", identifier):
+            raise RalphError(
+                f"invalid external-evidence exclusion ID: {identifier}"
+            )
+        if identifier in identifiers:
+            raise RalphError(
+                f"duplicate external-evidence exclusion ID: {identifier}"
+            )
+        identifiers.add(identifier)
+
+        repository = row[columns["repository"]].strip() or CONTROL_REPOSITORY_ID
+        if repository not in repositories:
+            raise RalphError(
+                f"{identifier} references unmapped repository {repository!r}"
+            )
+        excluded_raw = row[columns["excluded"]].strip()
+        manifest_raw = row[columns["manifest"]].strip()
+        reason = row[columns["reason"]].strip()
+        for label, raw in (
+            ("Excluded path", excluded_raw),
+            ("Manifest path", manifest_raw),
+        ):
+            value = clean_cell(raw).rstrip("/")
+            if (
+                not value
+                or value.casefold().startswith("n/a")
+                or Path(value).is_absolute()
+            ):
+                raise RalphError(
+                    f"{identifier} {label} must be a repository-relative path"
+                )
+            if re.search(r"[*?\[\]]", value):
+                raise RalphError(
+                    f"{identifier} {label} must not use glob syntax"
+                )
+        if reason.casefold() in {"", "n/a", "na", "none", "-"}:
+            raise RalphError(f"{identifier} requires a substantive Reason")
+
+        excluded = repository_artifact_path(
+            clean_cell(excluded_raw).rstrip("/"),
+            repository,
+            repositories,
+        )
+        manifest = repository_artifact_path(
+            clean_cell(manifest_raw).rstrip("/"),
+            repository,
+            repositories,
+        )
+        key = (repository, excluded.relative)
+        if key in exclusion_keys:
+            raise RalphError(
+                f"duplicate external-evidence excluded path: "
+                f"{qualify_repository_relative(*key)}"
+            )
+        exclusion_keys.add(key)
+        parsed.append(
+            ExternalEvidenceExclusion(
+                identifier,
+                repository,
+                excluded.relative,
+                excluded.path,
+                manifest.relative,
+                manifest.path,
+                reason,
+            )
+        )
+
+    required: list[tuple[dict[str, str], RepositoryPath]] = []
+    for item in required_deliverables(plan):
+        required.append(
+            (
+                item,
+                repository_artifact_path(
+                    item["path"],
+                    item.get("repository", CONTROL_REPOSITORY_ID),
+                    repositories,
+                ),
+            )
+        )
+    for policy in parsed:
+        parents = [
+            reference
+            for _, reference in required
+            if reference.repository == policy.repository
+            and policy.excluded_relative.startswith(reference.relative + "/")
+        ]
+        if not parents:
+            raise RalphError(
+                f"{policy.identifier} Excluded path must be a strict descendant "
+                "of a required directory deliverable"
+            )
+        if any(
+            reference.path.exists()
+            and not reference.path.is_dir()
+            for reference in parents
+        ):
+            raise RalphError(
+                f"{policy.identifier} parent deliverable is not a directory"
+            )
+        covered = [
+            item["id"]
+            for item, reference in required
+            if reference.repository == policy.repository
+            and (
+                reference.relative == policy.excluded_relative
+                or reference.relative.startswith(
+                    policy.excluded_relative + "/"
+                )
+            )
+        ]
+        if covered:
+            raise RalphError(
+                f"{policy.identifier} Excluded path covers required deliverables: "
+                + ", ".join(sorted(covered))
+            )
+        if (
+            policy.manifest_relative == policy.excluded_relative
+            or policy.manifest_relative.startswith(
+                policy.excluded_relative + "/"
+            )
+        ):
+            raise RalphError(
+                f"{policy.identifier} Excluded path covers its Manifest path"
+            )
+        if policy.manifest_path.exists() and (
+            policy.manifest_path.is_symlink()
+            or not policy.manifest_path.is_file()
+        ):
+            raise RalphError(
+                f"{policy.identifier} Manifest path must be a regular file"
+            )
+
+    for index, left in enumerate(parsed):
+        for right in parsed[index + 1 :]:
+            if left.repository != right.repository:
+                continue
+            if (
+                left.excluded_relative.startswith(
+                    right.excluded_relative + "/"
+                )
+                or right.excluded_relative.startswith(
+                    left.excluded_relative + "/"
+                )
+            ):
+                raise RalphError(
+                    "overlapping external-evidence exclusions are ambiguous: "
+                    f"{left.identifier}, {right.identifier}"
+                )
+    return sorted(
+        parsed,
+        key=lambda item: (
+            item.repository,
+            item.excluded_relative,
+            item.manifest_relative,
+            item.identifier,
+        ),
+    )
+
+
+def external_evidence_by_repository(
+    plan: str,
+    repositories: dict[str, Path],
+) -> dict[str, list[ExternalEvidenceExclusion]]:
+    grouped: dict[str, list[ExternalEvidenceExclusion]] = {}
+    for policy in external_evidence_exclusions(plan, repositories):
+        grouped.setdefault(policy.repository, []).append(policy)
+    return grouped
+
+
+def external_evidence_contract_expansions(
+    previous_plan: str,
+    current_plan: str,
+    repositories: dict[str, Path],
+) -> list[ExternalEvidenceExclusion]:
+    previous = external_evidence_exclusions(previous_plan, repositories)
+    current = external_evidence_exclusions(current_plan, repositories)
+    return [
+        policy
+        for policy in current
+        if not any(
+            old.repository == policy.repository
+            and old.manifest_relative == policy.manifest_relative
+            and (
+                old.excluded_relative == policy.excluded_relative
+                or policy.excluded_relative.startswith(
+                    old.excluded_relative + "/"
+                )
+            )
+            for old in previous
+        )
+    ]
+
+
+def assert_external_evidence_manifests_ready(
+    policies: Iterable[ExternalEvidenceExclusion],
+    *,
+    label: str,
+) -> None:
+    missing_or_invalid = sorted(
+        {
+            str(policy.manifest_path)
+            for policy in policies
+            if (
+                policy.manifest_path.is_symlink()
+                or not policy.manifest_path.is_file()
+            )
+        }
+    )
+    if missing_or_invalid:
+        raise RalphError(
+            f"{label} external-evidence manifests must be regular files: "
+            + ", ".join(missing_or_invalid)
+        )
 
 
 def strip_comments(text: str) -> str:
@@ -3126,6 +3596,9 @@ def deliverable_budget_coverage(
     workspace_root: Path,
     repositories: dict[str, Path] | None = None,
 ) -> list[str]:
+    roots = repositories or {
+        CONTROL_REPOSITORY_ID: workspace_root.resolve(strict=True)
+    }
     guarded = [
         scope
         for budget in budgets
@@ -3141,9 +3614,6 @@ def deliverable_budget_coverage(
     errors: list[str] = []
     for item in parse_deliverables(plan):
         try:
-            roots = repositories or {
-                CONTROL_REPOSITORY_ID: workspace_root.resolve(strict=True)
-            }
             path = qualified_repository_path(
                 repository_artifact_path(
                     item["path"],
@@ -3158,6 +3628,28 @@ def deliverable_budget_coverage(
             errors.append(
                 f"{item['id']} path {path} is neither budget-guarded nor "
                 "explicitly excluded with a reason"
+            )
+    seen_manifests: set[tuple[str, str]] = set()
+    try:
+        policies = external_evidence_exclusions(plan, roots)
+    except RalphError as exc:
+        errors.append(str(exc))
+        policies = []
+    for policy in policies:
+        key = (policy.repository, policy.manifest_relative)
+        if key in seen_manifests:
+            continue
+        seen_manifests.add(key)
+        path = qualify_repository_relative(*key)
+        directly_guarded = any(
+            path_in_scopes(path, budget["paths"])
+            and not path_in_scopes(path, budget["exclusions"])
+            for budget in budgets
+        )
+        if not directly_guarded:
+            errors.append(
+                f"external-evidence manifest {path} is not directly "
+                "budget-guarded or is covered by a budget exclusion"
             )
     return errors
 
@@ -3383,6 +3875,7 @@ def artifact_references(
     roots = repositories or {
         CONTROL_REPOSITORY_ID: workspace_root.resolve(strict=True)
     }
+    external_evidence = external_evidence_exclusions(plan, roots)
     items = parse_deliverables(plan) if include_optional else required_deliverables(plan)
     references: dict[tuple[str, str], RepositoryPath] = {}
     for item in items:
@@ -3392,10 +3885,37 @@ def artifact_references(
             roots,
         )
         references[(reference.repository, reference.relative)] = reference
+    for policy in external_evidence:
+        reference = RepositoryPath(
+            policy.repository,
+            roots[policy.repository],
+            policy.manifest_relative,
+            policy.manifest_path,
+        )
+        references[(reference.repository, reference.relative)] = reference
     for raw in explicit:
         repository, path = explicit_artifact_spec(raw, roots)
         reference = repository_artifact_path(path, repository, roots)
         references[(reference.repository, reference.relative)] = reference
+    hidden_artifacts = sorted(
+        qualify_repository_relative(reference.repository, reference.relative)
+        for reference in references.values()
+        if any(
+            policy.repository == reference.repository
+            and (
+                reference.relative == policy.excluded_relative
+                or reference.relative.startswith(
+                    policy.excluded_relative + "/"
+                )
+            )
+            for policy in external_evidence
+        )
+    )
+    if hidden_artifacts:
+        raise RalphError(
+            "external-evidence exclusions must not hide snapshot artifacts: "
+            + ", ".join(hidden_artifacts)
+        )
     return [references[key] for key in sorted(references)]
 
 
@@ -3516,7 +4036,10 @@ def hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def hash_path(path: Path) -> dict[str, object]:
+def hash_path(
+    path: Path,
+    exclusions: Iterable[Path] = (),
+) -> dict[str, object]:
     if path.is_symlink():
         return {
             "type": "symlink",
@@ -3527,7 +4050,7 @@ def hash_path(path: Path) -> dict[str, object]:
         return {"type": "file", "sha256": hash_file(path), "size": path.stat().st_size}
     if path.is_dir():
         members: list[dict[str, object]] = []
-        for member in sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()):
+        for member in snapshot_tree_members(path, exclusions):
             relative = member.relative_to(path).as_posix()
             if member.is_symlink():
                 item = hash_path(member)
@@ -3707,6 +4230,8 @@ def snapshot_data(
         artifact_arguments,
         roots,
     )
+    external_evidence = external_evidence_exclusions(plan, roots)
+    exclusions_by_repository = external_evidence_by_repository(plan, roots)
     assert_artifacts_do_not_overlap_task_pack(
         (reference.path for reference in artifacts),
         task_dir,
@@ -3718,12 +4243,33 @@ def snapshot_data(
             if multi_repository
             else display_path(reference.path, workspace_root)
         )
-        entries.append({"path": entry_path, **hash_path(reference.path)})
+        entries.append(
+            {
+                "path": entry_path,
+                **hash_path(
+                    reference.path,
+                    (
+                        policy.excluded_path
+                        for policy in exclusions_by_repository.get(
+                            reference.repository,
+                            [],
+                        )
+                        if policy.excluded_relative.startswith(
+                            reference.relative + "/"
+                        )
+                    ),
+                ),
+            }
+        )
     entries.sort(key=lambda item: str(item["path"]))
     schema = (
-        "rd-ralph-snapshot-v2"
-        if multi_repository
-        else "rd-ralph-snapshot-v1"
+        "rd-ralph-snapshot-v3"
+        if external_evidence
+        else (
+            "rd-ralph-snapshot-v2"
+            if multi_repository
+            else "rd-ralph-snapshot-v1"
+        )
     )
     participant_commits = {
         str(participant["id"]): str(
@@ -3741,6 +4287,15 @@ def snapshot_data(
         "schema": schema,
         "entries": entries,
     }
+    if external_evidence:
+        canonical_payload["external_evidence"] = [
+            {
+                "repository": policy.repository,
+                "excluded_path": policy.excluded_relative,
+                "manifest_path": policy.manifest_relative,
+            }
+            for policy in external_evidence
+        ]
     if multi_repository:
         canonical_payload["participant_commits"] = participant_commits
     canonical = json.dumps(
@@ -3756,6 +4311,8 @@ def snapshot_data(
     }
     if multi_repository:
         result["participant_commits"] = participant_commits
+    if external_evidence:
+        result["external_evidence"] = canonical_payload["external_evidence"]
     return result
 
 
@@ -5587,6 +6144,10 @@ def authenticate_multi_repository_candidate(
         explicit_artifacts,
         repositories,
     )
+    exclusions_by_repository = external_evidence_by_repository(
+        texts["plan.md"],
+        repositories,
+    )
     if verify_control_tree:
         current_task_git_dir = git_relative(
             task_dir,
@@ -5603,6 +6164,13 @@ def authenticate_multi_repository_candidate(
             paths_by_repository.get(CONTROL_REPOSITORY_ID, []),
             candidate,
             label="CONTROL candidate snapshot",
+            exclusions=[
+                policy.excluded_relative
+                for policy in exclusions_by_repository.get(
+                    CONTROL_REPOSITORY_ID,
+                    [],
+                )
+            ],
         )
     else:
         for name in SNAPSHOT_DOCS:
@@ -5644,6 +6212,13 @@ def authenticate_multi_repository_candidate(
             control_artifact_paths,
             candidate,
             label="CONTROL candidate deliverables",
+            exclusions=[
+                policy.excluded_relative
+                for policy in exclusions_by_repository.get(
+                    CONTROL_REPOSITORY_ID,
+                    [],
+                )
+            ],
         )
 
     participant_records: list[dict[str, object]] = []
@@ -5701,6 +6276,10 @@ def authenticate_multi_repository_candidate(
             paths_by_repository.get(repository, []),
             candidate_head,
             label=f"{repository} candidate snapshot",
+            exclusions=[
+                policy.excluded_relative
+                for policy in exclusions_by_repository.get(repository, [])
+            ],
         )
         participant_records.append(
             {
@@ -5984,11 +6563,24 @@ def participant_checkpoint_command(args: argparse.Namespace) -> int:
         args.artifact,
         repositories,
     ).get(repository, [])
+    repository_evidence = external_evidence_by_repository(
+        str(preflight["current"]["plan.md"]),
+        repositories,
+    ).get(repository, [])
+    assert_external_evidence_manifests_ready(
+        repository_evidence,
+        label=f"{repository} snapshot",
+    )
+    snapshot_exclusions = [
+        policy.excluded_relative
+        for policy in repository_evidence
+    ]
     assert_repository_paths_trackable_before_commit(
         root,
         snapshot_paths,
         changed,
         label=f"{repository} snapshot",
+        exclusions=snapshot_exclusions,
     )
     stage_helper_paths(root, changed, before_wip)
     try:
@@ -5996,6 +6588,7 @@ def participant_checkpoint_command(args: argparse.Namespace) -> int:
             root,
             snapshot_paths,
             label=f"{repository} snapshot",
+            exclusions=snapshot_exclusions,
         )
     except RalphError as exc:
         try:
@@ -6050,6 +6643,7 @@ def participant_checkpoint_command(args: argparse.Namespace) -> int:
         snapshot_paths,
         commit,
         label=f"{repository} snapshot",
+        exclusions=snapshot_exclusions,
     )
     remaining = git_changed_paths(root)
     if remaining:
@@ -6861,6 +7455,22 @@ def assert_multi_implementer_plan_authority(
                 for repository, item_id, path in changed_budgets
             )
         )
+    external_expansions = external_evidence_contract_expansions(
+        previous_plan,
+        current_plan,
+        repositories,
+    )
+    if external_expansions:
+        raise RalphError(
+            "Implementer expanded External Evidence Exclusions; route through "
+            "an authorized Planner checkpoint: "
+            + ", ".join(
+                f"{policy.identifier} "
+                f"{qualify_repository_relative(policy.repository, policy.excluded_relative)} "
+                f"-> {policy.manifest_relative}"
+                for policy in external_expansions
+            )
+        )
 
     previous_references = {
         (reference.repository, reference.relative)
@@ -7032,6 +7642,18 @@ def multi_repository_implementer_checkpoint(
         args.artifact,
         repositories,
     )
+    exclusions_by_repository = external_evidence_by_repository(
+        current_plan,
+        repositories,
+    )
+    assert_external_evidence_manifests_ready(
+        (
+            policy
+            for policies in exclusions_by_repository.values()
+            for policy in policies
+        ),
+        label="multi-repository snapshot",
+    )
     control_snapshot_paths = paths_by_repository.get(
         CONTROL_REPOSITORY_ID,
         [],
@@ -7041,6 +7663,13 @@ def multi_repository_implementer_checkpoint(
         control_snapshot_paths,
         control_changed,
         label="CONTROL snapshot",
+        exclusions=[
+            policy.excluded_relative
+            for policy in exclusions_by_repository.get(
+                CONTROL_REPOSITORY_ID,
+                [],
+            )
+        ],
     )
     for repository, state in sorted(states.items()):
         root = state["root"]
@@ -7050,6 +7679,10 @@ def multi_repository_implementer_checkpoint(
             paths_by_repository.get(repository, []),
             participant_commits[repository],
             label=f"{repository} snapshot",
+            exclusions=[
+                policy.excluded_relative
+                for policy in exclusions_by_repository.get(repository, [])
+            ],
         )
 
     before_wip = wip_fingerprint(workspace_root)
@@ -7060,6 +7693,13 @@ def multi_repository_implementer_checkpoint(
             workspace_root,
             control_snapshot_paths,
             label="CONTROL snapshot",
+            exclusions=[
+                policy.excluded_relative
+                for policy in exclusions_by_repository.get(
+                    CONTROL_REPOSITORY_ID,
+                    [],
+                )
+            ],
         )
     except RalphError as exc:
         try:
@@ -7120,6 +7760,13 @@ def multi_repository_implementer_checkpoint(
         control_snapshot_paths,
         commit,
         label="CONTROL snapshot",
+        exclusions=[
+            policy.excluded_relative
+            for policy in exclusions_by_repository.get(
+                CONTROL_REPOSITORY_ID,
+                [],
+            )
+        ],
     )
     for repository, state in sorted(states.items()):
         root = state["root"]
@@ -7477,6 +8124,21 @@ def checkpoint_command(args: argparse.Namespace) -> int:
                     for item_id, path in changed_budget_assignments
                 )
             )
+        external_expansions = external_evidence_contract_expansions(
+            previous_plan,
+            texts["plan.md"],
+            repositories,
+        )
+        if external_expansions:
+            raise RalphError(
+                "Implementer expanded External Evidence Exclusions; route through "
+                "an authorized Planner checkpoint: "
+                + ", ".join(
+                    f"{policy.identifier} {policy.excluded_relative} "
+                    f"-> {policy.manifest_relative}"
+                    for policy in external_expansions
+                )
+            )
         explicitly_allowed_new = {
             str(
                 normalize_artifact_path(
@@ -7792,6 +8454,25 @@ def checkpoint_command(args: argparse.Namespace) -> int:
                 + ", ".join(
                     f"{repository}:{item_id} -> {path}"
                     for repository, item_id, path in changed_budget_assignments
+                )
+            )
+        external_expansions = external_evidence_contract_expansions(
+            previous_plan,
+            checkpoint_plan,
+            repositories,
+        )
+        if external_expansions and (
+            not args.allow_contract_change
+            or not args.authorization_token
+        ):
+            raise RalphError(
+                "Planner External Evidence Exclusions expansion requires both "
+                "--allow-contract-change and --authorization-token: "
+                + ", ".join(
+                    f"{policy.identifier} "
+                    f"{qualify_repository_relative(policy.repository, policy.excluded_relative)} "
+                    f"-> {policy.manifest_relative}"
+                    for policy in external_expansions
                 )
             )
     assert_next_checkpoint(chain, args.role, args.iteration)
