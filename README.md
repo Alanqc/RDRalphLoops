@@ -6,7 +6,9 @@ three-role Ralph loop:
 ```text
 Planner? -> Implementer -> Reviewer
                |             |
-               |             +-- ACCEPTED --------> archive + manual-merge handoff
+               |             +-- ACCEPTED --------> wait for user confirmation
+               |                                      |
+               |                                      `-> archive + manual-merge handoff
                |             +-- CHANGES_REQUIRED -> guard -> Implementer or PAUSED
                |             +-- NEEDS_REPLAN ----> guard -> Planner or PAUSED
                |             `-- BLOCKED ---------> PAUSED[EXTERNAL]
@@ -16,7 +18,9 @@ Planner? -> Implementer -> Reviewer
 The Planner is mandatory during initialization and conditional in later iterations. The
 Implementer is mandatory in every implementation iteration, and an independent Reviewer is
 mandatory for every immutable candidate. Plan consultation happens before candidate creation. A
-loop finishes only after the Reviewer accepts the exact candidate.
+role loop finishes only after the Reviewer accepts the exact candidate. Archival is a separate
+user-controlled step: the Controller reports the accepted result and waits for explicit
+post-acceptance confirmation.
 
 Protocol v3 supports one control repository plus zero or more participant repositories:
 
@@ -51,7 +55,8 @@ candidate-vector fields set to `N/A`.
 - Immutable candidate commits and content snapshots for independent review.
 - Protocol-v3 candidate vectors spanning CONTROL plus registered `REPO-NNN` participants, sealed
   by a final CONTROL commit.
-- Evidence-gated acceptance, four-pack archival, retained deliverables, and index updates.
+- Evidence-gated acceptance followed by an explicit user-confirmation gate before four-pack
+  archival, retained deliverables, and index updates.
 - A manual multi-repository merge handoff with each repository's Base, branch, accepted commit,
   checks, and merge order. The plugin does not merge, push, rebase, cherry-pick, or delete
   worktrees.
@@ -67,7 +72,7 @@ all stored under [`plugins/rd-ralph-loop`](plugins/rd-ralph-loop).
 - Python 3.10 or newer.
 - Git with linked-worktree support.
 
-Version `0.3.0` is validated on macOS and uses a POSIX-oriented test suite. Windows support has not
+Version `0.3.1` is validated on macOS and uses a POSIX-oriented test suite. Windows support has not
 yet been verified. Configure a Git author identity before starting a Git-mode loop.
 
 ## Install
@@ -99,8 +104,9 @@ In a new Codex task, ask:
 
 ```text
 Run this R&D task with the R&D Ralph Loop plugin. Use a dedicated worktree,
-iterate until independent acceptance, archive the four-document pack, and leave
-the resulting branch for me to merge manually:
+iterate until independent acceptance, show me the accepted candidate and evidence,
+then wait for my explicit confirmation before archiving the four-document pack and
+preparing the branch for me to merge manually:
 
 <your task>
 ```
@@ -157,7 +163,7 @@ registry, and CONTROL receives a fresh Planner checkpoint.
 | Implementer | Every implementation iteration | Declared deliverables inside registered repository scopes, CONTROL `plan.md`, and necessary `design.md` amendments | No |
 | Reviewer | Every immutable candidate vector | Append-only typed CONTROL `verify.md`; read-only verification of every sealed repository | No |
 | Controller | Entire run | Orchestration and lifecycle state | Commits changed participants in stable order, creates final CONTROL seal, and records Control events |
-| User | Registry authorization and manual integration | Repository/scope decisions, conflict resolution, final integration | Merges each repository manually |
+| User | Registry authorization, post-acceptance archive approval, and manual integration | Repository/scope decisions, archive decision, conflict resolution, final integration | Confirms archival, then merges each repository manually |
 
 See the full [skill instructions](plugins/rd-ralph-loop/skills/run-rd-ralph-loop/SKILL.md),
 [protocol](plugins/rd-ralph-loop/skills/run-rd-ralph-loop/references/protocol.md), and

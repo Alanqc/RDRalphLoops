@@ -20,6 +20,10 @@ RALPH = (
     / "scripts"
     / "ralph_loop.py"
 )
+ARCHIVE_CONFIRMATION = "post-acceptance-user-confirmation"
+ARCHIVE_CONFIRMATION_SHA256 = hashlib.sha256(
+    ARCHIVE_CONFIRMATION.encode("utf-8")
+).hexdigest()
 
 
 def run(
@@ -1488,6 +1492,8 @@ class GitFlowTest(unittest.TestCase):
                 "tasks/archive",
                 "--index",
                 "tasks/index.md",
+                "--authorization-token",
+                ARCHIVE_CONFIRMATION,
                 expected=2,
             )
             self.assertIn("Reviewer checkpoint", skipped_reviewer.stderr)
@@ -1527,6 +1533,34 @@ class GitFlowTest(unittest.TestCase):
                 "--iteration",
                 "1",
             )
+            reviewer_head = git(worktree_a, "rev-parse", "HEAD")
+            index_before_confirmation = (
+                worktree_a / "tasks/index.md"
+            ).read_bytes()
+            missing_archive_confirmation = cli(
+                "archive",
+                "--workspace-root",
+                str(worktree_a),
+                "--task-dir",
+                str(task_dir),
+                "--archive-root",
+                "tasks/archive",
+                "--index",
+                "tasks/index.md",
+                expected=2,
+            )
+            self.assertIn(
+                "--authorization-token",
+                missing_archive_confirmation.stderr,
+            )
+            self.assertEqual(git(worktree_a, "rev-parse", "HEAD"), reviewer_head)
+            self.assertEqual(git(worktree_a, "status", "--porcelain"), "")
+            self.assertEqual(
+                (worktree_a / "tasks/index.md").read_bytes(),
+                index_before_confirmation,
+            )
+            self.assertTrue(task_dir.exists())
+            self.assertFalse((worktree_a / "tasks/archive/TASK-A").exists())
             verify_at_review = run(
                 [
                     "git",
@@ -1554,6 +1588,8 @@ class GitFlowTest(unittest.TestCase):
                 "tasks/archive",
                 "--index",
                 "tasks/index.md",
+                "--authorization-token",
+                ARCHIVE_CONFIRMATION,
                 expected=2,
             )
             self.assertIn("clean worktree", mutated_review.stderr)
@@ -1574,6 +1610,8 @@ class GitFlowTest(unittest.TestCase):
                 "tasks/archive",
                 "--index",
                 "tasks/index.md",
+                "--authorization-token",
+                ARCHIVE_CONFIRMATION,
                 expected=2,
             )
             self.assertIn(
@@ -1603,6 +1641,8 @@ class GitFlowTest(unittest.TestCase):
                 "tasks/archive",
                 "--index",
                 "tasks/index.md",
+                "--authorization-token",
+                ARCHIVE_CONFIRMATION,
                 expected=2,
             )
             self.assertIn(
@@ -1622,9 +1662,41 @@ class GitFlowTest(unittest.TestCase):
                     "tasks/archive",
                     "--index",
                     "tasks/index.md",
+                    "--authorization-token",
+                    ARCHIVE_CONFIRMATION,
                 ).stdout
             )
+            self.assertEqual(
+                archive["archive_authorization_sha256"],
+                ARCHIVE_CONFIRMATION_SHA256,
+            )
             archived_task = Path(archive["archived_task_dir"])
+            archive_wip = git(worktree_a, "status", "--porcelain")
+            missing_closure_confirmation = cli(
+                "checkpoint",
+                "--workspace-root",
+                str(worktree_a),
+                "--task-dir",
+                str(task_dir),
+                "--archive-task-dir",
+                str(archived_task),
+                "--index",
+                "tasks/index.md",
+                "--task-id",
+                "TASK-A",
+                "--role",
+                "closure",
+                "--iteration",
+                "1",
+                expected=2,
+            )
+            self.assertIn(
+                "closure checkpoint requires --authorization-token",
+                missing_closure_confirmation.stderr,
+            )
+            self.assertEqual(git(worktree_a, "rev-parse", "HEAD"), reviewer_head)
+            self.assertEqual(git(worktree_a, "status", "--porcelain"), archive_wip)
+            self.assertTrue(archived_task.exists())
             exclude.write_text(
                 original_exclude + "\ntasks/archive/\n",
                 encoding="utf-8",
@@ -1645,6 +1717,8 @@ class GitFlowTest(unittest.TestCase):
                 "closure",
                 "--iteration",
                 "1",
+                "--authorization-token",
+                ARCHIVE_CONFIRMATION,
                 expected=2,
             )
             self.assertIn(
@@ -1671,7 +1745,24 @@ class GitFlowTest(unittest.TestCase):
                     "closure",
                     "--iteration",
                     "1",
+                    "--authorization-token",
+                    ARCHIVE_CONFIRMATION,
                 ).stdout
+            )
+            self.assertEqual(
+                closure["archive_authorization_sha256"],
+                ARCHIVE_CONFIRMATION_SHA256,
+            )
+            closure_message = git(
+                worktree_a,
+                "show",
+                "-s",
+                "--format=%B",
+                closure["commit"],
+            )
+            self.assertIn(
+                f"Ralph-Authorization-SHA256: {ARCHIVE_CONFIRMATION_SHA256}",
+                closure_message,
             )
             git(
                 worktree_a,
@@ -1715,6 +1806,10 @@ class GitFlowTest(unittest.TestCase):
             self.assertEqual(handoff["base_commit"], base)
             self.assertEqual(handoff["accepted_candidate_commit"], candidate)
             self.assertEqual(handoff["closure_commit"], closure["commit"])
+            self.assertEqual(
+                handoff["archive_authorization_sha256"],
+                ARCHIVE_CONFIRMATION_SHA256,
+            )
 
             self.assertEqual(git(integration, "rev-parse", "HEAD"), base)
             self.assertEqual(git(worktree_b, "rev-parse", "HEAD"), base)
@@ -2336,6 +2431,8 @@ class ProtocolV3RepositoryMappingTest(unittest.TestCase):
                 "tasks/archive",
                 "--index",
                 "tasks/index.md",
+                "--authorization-token",
+                ARCHIVE_CONFIRMATION,
             )
             archived_task = Path(archive["archived_task_dir"])
             self.assertFalse(task_dir.exists())
@@ -2343,6 +2440,10 @@ class ProtocolV3RepositoryMappingTest(unittest.TestCase):
             self.assertEqual(
                 archive["candidate_vector_sha256"],
                 candidate_vector,
+            )
+            self.assertEqual(
+                archive["archive_authorization_sha256"],
+                ARCHIVE_CONFIRMATION_SHA256,
             )
             index_text = (control / "tasks/index.md").read_text(encoding="utf-8")
             self.assertIn("REPO-001:artifact/output.txt", index_text)
@@ -2367,6 +2468,8 @@ class ProtocolV3RepositoryMappingTest(unittest.TestCase):
                 "closure",
                 "--iteration",
                 "1",
+                "--authorization-token",
+                ARCHIVE_CONFIRMATION,
                 expected=2,
             )
             self.assertIn("outside its authority", rejected_closure.stderr)
@@ -2389,6 +2492,8 @@ class ProtocolV3RepositoryMappingTest(unittest.TestCase):
                 "closure",
                 "--iteration",
                 "1",
+                "--authorization-token",
+                ARCHIVE_CONFIRMATION,
             )
             closure_message = git(
                 control,
@@ -2399,6 +2504,10 @@ class ProtocolV3RepositoryMappingTest(unittest.TestCase):
             )
             self.assertIn(f"Ralph-Repositories: {canonical_map}", closure_message)
             self.assertIn(f"Ralph-Vector: {candidate_vector}", closure_message)
+            self.assertIn(
+                f"Ralph-Authorization-SHA256: {ARCHIVE_CONFIRMATION_SHA256}",
+                closure_message,
+            )
             handoff = self._json(
                 "handoff",
                 control,
@@ -2413,6 +2522,10 @@ class ProtocolV3RepositoryMappingTest(unittest.TestCase):
             self.assertFalse(handoff["integration_mutated"])
             self.assertEqual(handoff["participant_commits"], participant_commits)
             self.assertEqual(handoff["candidate_vector_sha256"], candidate_vector)
+            self.assertEqual(
+                handoff["archive_authorization_sha256"],
+                ARCHIVE_CONFIRMATION_SHA256,
+            )
             self.assertEqual(
                 [item["repository"] for item in handoff["repositories"]],
                 ["REPO-001", "REPO-002", "CONTROL"],
@@ -3518,6 +3631,7 @@ class ArchiveTransactionRegressionTest(unittest.TestCase):
             archive_root="tasks/archive",
             index="tasks/index.md",
             artifact=explicit_artifacts,
+            authorization_token=ARCHIVE_CONFIRMATION,
         )
         return args, task_dir, destination, index, index_text
 

@@ -1,6 +1,6 @@
 ---
 name: run-rd-ralph-loop
-description: Orchestrate evidence-gated research and development work as a three-role Ralph loop using proposal.md, design.md, plan.md, and verify.md. Use when Codex must run one or more isolated R&D loops, create dedicated Git worktrees and branches, checkpoint Planner/Implementer/Reviewer changes, obtain independent acceptance, archive the four-document task pack, or prepare a user-controlled manual-merge handoff; also trigger for Ralph loop, 研发闭环, 四件套, iterative implementation/review, and acceptance-gated archival.
+description: Orchestrate evidence-gated research and development work as a three-role Ralph loop using proposal.md, design.md, plan.md, and verify.md. Use when Codex must run one or more isolated R&D loops, create dedicated Git worktrees and branches, checkpoint Planner/Implementer/Reviewer changes, obtain independent acceptance, wait for user-confirmed archival, archive the four-document task pack, or prepare a user-controlled manual-merge handoff; also trigger for Ralph loop, 研发闭环, 四件套, iterative implementation/review, and acceptance-gated archival.
 ---
 
 # Run an R&D Ralph Loop
@@ -9,7 +9,9 @@ Use one interactive Controller and three isolated roles: Planner, Implementer, a
 the Planner mandatory at initialization and conditional later. Run the Implementer in every
 implementation iteration and an independent Reviewer for every immutable candidate. An
 Implementer plan consultation stays inside the same iteration and creates no candidate or review.
-Treat Reviewer acceptance as the only successful exit.
+Treat Reviewer acceptance as the only successful exit from the role loop. Acceptance does not
+authorize archival: the Controller must show the accepted result to the user and wait for a new,
+explicit post-acceptance confirmation before archive or Closure.
 
 The Controller owns orchestration, Git state in the workspace/control repository and every
 registered participant repository, checkpoints, status updates, and user interaction. Role agents
@@ -43,8 +45,10 @@ Resolve `<skill-root>` as the directory containing this `SKILL.md`; run bundled 
 - Treat pause, resume, abandon, split, plan-query, and plan-response as Controller-owned
   append-only events. In Git mode, use empty Control checkpoints that leave current WIP unstaged
   and untouched.
-- Do not send the final response while a required role is still running. Finalize only after
-  acceptance, archival, closure checkpoint, and handoff.
+- Do not send the final response while a required role is still running. After Reviewer
+  `ACCEPTED`, send the acceptance evidence and exact candidate/vector summary to the user, then
+  stop in `AWAITING_USER_ARCHIVE_CONFIRMATION`. Only a later explicit confirmation may continue
+  through archival, Closure, and handoff.
 
 ## Isolate every Git loop
 
@@ -323,7 +327,8 @@ For iteration `N`:
    commit equal the immutable candidate vector and their Implementer trailers.
 8. Route the verdict:
 
-   - `ACCEPTED`: run the accepted gate, close, archive, and hand off.
+   - `ACCEPTED`: run the accepted gate, report the accepted candidate/vector and evidence to the
+     user, then stop in `AWAITING_USER_ARCHIVE_CONFIRMATION`. Do not archive automatically.
    - `BLOCKED`: record an explicit Control pause with reason `EXTERNAL`; never route it
      mechanically to Planner.
    - `CHANGES_REQUIRED` or `NEEDS_REPLAN`: run the post-review guard before dispatching another
@@ -399,15 +404,25 @@ Accept only when every `AC-*` is `PASS`, required deliverables exist at declared
 independently reproduced, required items are complete, no blocking finding remains, and the latest
 review records the current snapshot and immutable candidate commit.
 
-Any post-review change to `proposal.md`, `design.md`, `plan.md`, or a deliverable invalidates
-acceptance and requires another Implementer candidate plus fresh Reviewer. Never amend or rewrite a
-reviewed candidate commit.
+Never mutate an accepted run while user archive confirmation is pending. If the user rejects the
+accepted result or requests changed bytes, leave it unarchived; with explicit user authorization,
+record `abandon` and start a new superseding task that references the accepted candidate. The new
+task runs Planner -> Implementer -> Reviewer. Never amend or rewrite a reviewed candidate commit.
 
 After exact archive-ready bytes are accepted:
 
-1. Preserve deliverables at their owner paths and keep every participant worktree clean at its
+1. Present the acceptance summary to the user and wait. The confirmation must be a new explicit
+   message after the user has seen the Reviewer verdict, accepted CONTROL candidate, participant
+   vector, checks, residual risks, and retained deliverables. An earlier blanket request such as
+   "run until accepted and archive" does not count. Use a non-secret reference to that confirmation
+   as `<post-acceptance-user-confirmation>` in both commands below.
+   If the user withholds confirmation, remain here without mutation. If the user rejects the
+   result, use the authorized abandon-and-supersede path above rather than reopening the accepted
+   checkpoint chain.
+2. Preserve deliverables at their owner paths and keep every participant worktree clean at its
    accepted candidate commit.
-2. Move the complete four-pack byte-for-byte to the archive and update the branch-local index in
+3. Only after confirmation, move the complete four-pack byte-for-byte to the archive and update
+   the branch-local index in
    the same closure change. With the bundled marker-managed index, run:
 
    ```bash
@@ -415,13 +430,15 @@ After exact archive-ready bytes are accepted:
      --workspace-root <worktree> \
      --task-dir <active-task-dir> \
      --archive-root <tasks-archive-root> \
-     --index <task-index>
+     --index <task-index> \
+     --authorization-token <post-acceptance-user-confirmation>
    ```
 
    The gate requires the active pack and index in the Reviewer commit and rejects ignored archive
-   destinations. A local ignored file is not an integration artifact.
-3. Re-run repository, link, whitespace, unique-ID/location, and archived lifecycle checks.
-4. Create the closure checkpoint:
+   destinations. It refuses missing user confirmation and reports only its SHA-256, never the
+   confirmation text. A local ignored file is not an integration artifact.
+4. Re-run repository, link, whitespace, unique-ID/location, and archived lifecycle checks.
+5. Create the closure checkpoint with the same confirmation reference:
 
    ```bash
    python3 <skill-root>/scripts/ralph_loop.py checkpoint \
@@ -431,12 +448,14 @@ After exact archive-ready bytes are accepted:
      --index <task-index> \
      --task-id <task-id> \
      --role closure \
-     --iteration N
+     --iteration N \
+     --authorization-token <post-acceptance-user-confirmation>
    ```
 
    Closure must capture all four active deletions, all four archived additions, and the index
-   update.
-5. Produce the read-only manual-merge handoff:
+   update. Its `Ralph-Authorization-SHA256` trailer is the durable audit record that the user
+   approved archival after acceptance.
+6. Produce the read-only manual-merge handoff:
 
    ```bash
    python3 <skill-root>/scripts/ralph_loop.py handoff \
@@ -469,6 +488,7 @@ and handoff.
   content snapshot so Reviewer can append evidence.
 - Keep Reviewer history append-only and failed candidates reachable; never amend reviewed commits.
 - Make each rejection actionable with stable `F-*` IDs and `AC-*` mappings.
+- Never treat Reviewer `ACCEPTED` or an earlier run instruction as user authorization to archive.
 - Do not archive `BLOCKED`, `CHANGES_REQUIRED`, or `NEEDS_REPLAN`.
 - Do not treat plan status, Implementer claims, or a commit alone as acceptance evidence.
 - Preserve unrelated user changes and obey repository instructions throughout.

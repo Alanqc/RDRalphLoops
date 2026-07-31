@@ -7215,6 +7215,14 @@ def checkpoint_command(args: argparse.Namespace) -> int:
         )
     if args.iteration < 0:
         raise RalphError("--iteration must be zero or greater")
+    if args.role == "closure" and (
+        not args.authorization_token
+        or not args.authorization_token.strip()
+    ):
+        raise RalphError(
+            "closure checkpoint requires --authorization-token from the "
+            "explicit post-acceptance user confirmation"
+        )
     if git_staged_paths(workspace_root):
         raise RalphError(
             "staging area must be empty before a role checkpoint; "
@@ -8005,6 +8013,9 @@ def checkpoint_command(args: argparse.Namespace) -> int:
                 ),
                 "participant_commits": participant_commits,
                 "candidate_vector_sha256": candidate_vector,
+                "archive_authorization_sha256": (
+                    authorization if args.role == "closure" else None
+                ),
                 "changed_paths": sorted(changed),
                 "clean": True,
             },
@@ -8188,6 +8199,32 @@ def handoff_command(args: argparse.Namespace) -> int:
             raise RalphError(
                 f"closure commit trailer {key} is {actual or 'missing'}, expected {expected}"
             )
+    authorization_values = commit_trailer_values(
+        workspace_root,
+        head,
+    ).get("ralph-authorization-sha256", [])
+    if len(authorization_values) > 1:
+        raise RalphError(
+            "Closure checkpoint must contain at most one "
+            "Ralph-Authorization-SHA256"
+        )
+    archive_authorization = (
+        authorization_values[0].lower()
+        if authorization_values
+        else None
+    )
+    if archive_authorization is not None and not re.fullmatch(
+        r"[0-9a-f]{64}",
+        archive_authorization,
+    ):
+        raise RalphError(
+            "Closure checkpoint has an invalid Ralph-Authorization-SHA256"
+        )
+    if archive_authorization is None:
+        warnings.append(
+            "legacy Closure checkpoint has no post-acceptance archive "
+            "authorization record"
+        )
     assert_reviewer_checkpoint(
         workspace_root,
         identity,
@@ -8345,6 +8382,7 @@ def handoff_command(args: argparse.Namespace) -> int:
                     "accepted_candidate_commit": review["candidate_commit"],
                     "accepted_snapshot_sha256": snapshot["snapshot_sha256"],
                     "candidate_vector_sha256": candidate_vector,
+                    "archive_authorization_sha256": archive_authorization,
                     "participant_commits": participant_commits,
                     "repositories": repository_handoff,
                     "deliverables": artifacts,
@@ -8562,6 +8600,13 @@ def validate_command(args: argparse.Namespace) -> int:
 
 
 def archive_command(args: argparse.Namespace) -> int:
+    authorization_token = getattr(args, "authorization_token", None)
+    if not authorization_token or not authorization_token.strip():
+        raise RalphError(
+            "archive requires --authorization-token from an explicit "
+            "post-acceptance user confirmation"
+        )
+    archive_authorization = authorization_sha256(authorization_token)
     workspace_root = resolve_existing(Path(args.workspace_root), "workspace root")
     repositories = parse_repository_specs(
         getattr(args, "repo", []), workspace_root
@@ -8957,6 +9002,7 @@ def archive_command(args: argparse.Namespace) -> int:
                     "snapshot_sha256": snapshot["snapshot_sha256"],
                     "accepted_candidate_commit": review["candidate_commit"],
                     "candidate_vector_sha256": candidate_vector,
+                    "archive_authorization_sha256": archive_authorization,
                     "participant_commits": participant_commits,
                 },
                 repositories,
@@ -9099,6 +9145,7 @@ def build_parser() -> argparse.ArgumentParser:
     archive_parser.add_argument("--artifact", action="append", default=[])
     archive_parser.add_argument("--legacy-findings", action="store_true")
     archive_parser.add_argument("--allow-primary-worktree", action="store_true")
+    archive_parser.add_argument("--authorization-token", required=True)
     archive_parser.set_defaults(handler=archive_command)
 
     participant_parser = subparsers.add_parser(

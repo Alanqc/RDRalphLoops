@@ -138,10 +138,16 @@ This is a Controller checklist, not a role-agent prompt:
    not reset, amend, invent a partial vector, or start Reviewer. Reuse their shared preparation
    anchor after a Control-only configuration pause/resume; reject any intervening substantive
    checkpoint.
-6. After acceptance and CONTROL closure, return a manual multi-repository handoff containing
-   CONTROL plus every participant's repository ID, logical identity, Base, branch, candidate
-   commit, changed paths, checks, and registered merge order. Never merge, push, cherry-pick,
-   delete worktrees, or create an integration queue.
+6. After acceptance, show the user the verdict, exact CONTROL candidate, participant vector,
+   evidence, residual risks, and retained deliverables, then stop. Do not archive from an earlier
+   blanket run instruction. If the user withholds confirmation, make no change. If the user
+   rejects the result, obtain explicit authorization to abandon this accepted run and start a new
+   superseding task; do not reopen or mutate the accepted checkpoint chain.
+7. Only after a new explicit user confirmation, pass the same non-secret confirmation reference
+   to archive and Closure, then return a manual multi-repository handoff containing CONTROL plus
+   every participant's repository ID, logical identity, Base, branch, candidate commit, changed
+   paths, checks, and registered merge order. Never merge, push, cherry-pick, delete worktrees, or
+   create an integration queue.
 
 ## Reviewer
 
@@ -178,8 +184,9 @@ snapshot, accepted CONTROL candidate, and accepted candidate-vector summary fiel
 repository Verify schema. In durable Environment/command evidence, replace machine-local roots
 with `<CONTROL_WORKTREE>` and `<REPO-NNN_WORKTREE>` while preserving argv structure, exits, and
 relevant output; never persist an absolute participant worktree path. Do not fix issues or run
-Git-mutating commands. Return the verdict and next action; the Controller will validate and
-checkpoint only CONTROL verify.md.
+Git-mutating commands. Return the verdict and next action; for `ACCEPTED`, the next lifecycle is
+`AWAITING_USER_ARCHIVE_CONFIRMATION`, not archive. The Controller will validate and checkpoint only
+CONTROL verify.md.
 ```
 
 ## Archive-ready final Reviewer
@@ -202,5 +209,6 @@ and vector digest. Accept only if every AC passes, deliverables remain at regist
 and the proposed CONTROL archive transaction is byte-preserving. Do not move the task, update the
 index, fix deliverables, alter participant repositories, merge anything, or run Git-mutating
 commands. Any finding must use the same Type and Action class enums as an ordinary Reviewer. If
-rejected, leave it active for the next loop.
+accepted, recommend `AWAITING_USER_ARCHIVE_CONFIRMATION`; if rejected, leave it active for the next
+loop.
 ```

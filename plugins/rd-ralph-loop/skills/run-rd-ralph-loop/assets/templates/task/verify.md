@@ -52,7 +52,7 @@ Use exactly one action class: `SUBJECT_FIX`, `SHRINK_ASSURANCE`, `DIRECT_RECOMPU
 | Direct subject evidence delta | new immutable or live subject evidence, or NONE |
 | External blocker delta | newly resolved/introduced dependency IDs, or NONE |
 | Assurance surface delta | removed/added harness paths and physical lines, or NONE |
-| Recommended next lifecycle | ARCHIVE / IMPLEMENT / REPLAN / PAUSE_EXTERNAL |
+| Recommended next lifecycle | AWAITING_USER_ARCHIVE_CONFIRMATION / IMPLEMENT / REPLAN / PAUSE_EXTERNAL |
 
 Normalize machine-local roots in Environment and command evidence as `<CONTROL_WORKTREE>` and
 `<REPO-NNN_WORKTREE>`. Preserve argv structure, exit codes, and relevant output, but do not persist

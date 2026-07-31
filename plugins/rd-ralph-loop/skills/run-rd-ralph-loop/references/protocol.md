@@ -33,11 +33,15 @@ PLANNER_CONSULT
   ` EXTERNAL_BLOCKER         -> PAUSE_CONTROL[EXTERNAL]
 
 REVIEWING -> REVIEW_CHECKPOINT
-  | ACCEPTED         -> READY_TO_ARCHIVE -> ARCHIVED -> CLOSURE_CHECKPOINT
+  | ACCEPTED         -> AWAITING_USER_ARCHIVE_CONFIRMATION
   | BLOCKED          -> PAUSE_CONTROL[EXTERNAL]
   | CHANGES_REQUIRED -> GUARD_EVAL -> CONTINUE | PAUSE_CONTROL[reason set]
   ` NEEDS_REPLAN     -> GUARD_EVAL -> PLANNED  | PAUSE_CONTROL[reason set]
 
+AWAITING_USER_ARCHIVE_CONFIRMATION
+  -- explicit post-acceptance USER_CONFIRM --> READY_TO_ARCHIVE -> ARCHIVED -> CLOSURE_CHECKPOINT
+  -- no decision --------------------------> AWAITING_USER_ARCHIVE_CONFIRMATION
+  `-- authorized USER_REJECT --------------> ABANDONED -> NEW_SUPERSEDING_TASK
 PAUSE_CONTROL -> PAUSED
 PAUSED -- authorized RESUME_CONTROL --> PLANNED | IMPLEMENTING
 CLOSURE_CHECKPOINT -> MANUAL_MERGE_HANDOFF
@@ -51,6 +55,14 @@ review, verdict, or completed iteration.
 `REPLAN_STORM`, `USER_CHECKPOINT`, `PLAN_CONFLICT`, `CONFIGURATION_GAP`, or `SCHEMA_MIGRATION`.
 `BLOCKED` always becomes `PAUSED[EXTERNAL]`; it must never route mechanically to Planner. Current
 unstaged WIP is preserved, and no candidate or Reviewer is created while paused.
+
+`AWAITING_USER_ARCHIVE_CONFIRMATION` is a Controller wait boundary, not an automatic transition
+and not a substitute for `PAUSED`. The Controller must show the user the accepted candidate,
+participant vector, evidence, residual risks, and retained deliverables. Only a new explicit
+confirmation after that report authorizes archive and Closure; an earlier blanket run request
+does not. Withholding confirmation leaves the run unchanged. A rejection does not reopen the
+accepted checkpoint chain: after explicit user authorization, record `abandon` and create a new
+superseding task that references the accepted candidate.
 
 `MANUAL_MERGE_HANDOFF` is the plugin boundary, not proof that the user merged the branch.
 
@@ -66,7 +78,7 @@ unstaged WIP is preserved, and no candidate or Reviewer is created while paused.
 | Current/archived task registration | Project task index |
 | Stable deliverable body | Declared owner path outside the task pack |
 | Role dispatch, user steering, Git staging and commits in every registered repository | Controller |
-| Merge, cherry-pick, push, conflict resolution, worktree cleanup | User |
+| Post-acceptance archive authorization; merge, cherry-pick, push, conflict resolution, worktree cleanup | User |
 
 Repository-local instructions and templates override the bundled defaults. Do not duplicate a
 stable deliverable body into the task pack; link it and preserve its identity instead.
@@ -150,8 +162,9 @@ decision matrix. A summary is not a substitute for AC-level evidence.
   byte-for-byte untouched. In non-Git mode, append the fallback Control Event Ledger in `plan.md`.
 - Do not advance a dependency gate until the required role returns. Main-thread interactivity does
   not make Planner, Implementer, and Reviewer parallel within one loop.
-- Do not issue a final response while a mandatory role, checkpoint, archival validation, or
-  handoff remains incomplete.
+- Do not issue a final response while a mandatory role is running. After `ACCEPTED`, report the
+  acceptance result and stop for explicit user archive confirmation. Continue with archive,
+  Closure, and handoff only in response to that confirmation.
 
 ## Git checkpoint contract
 
@@ -167,7 +180,7 @@ verifying the role's filesystem changes.
 | Implementer candidate | `plan.md`, necessary `design.md`, declared deliverables | Task, Implementer, iteration, content snapshot |
 | Reviewer evidence | `verify.md` only | Task, Reviewer, iteration, candidate, snapshot, verdict |
 | Control event | No staged paths; empty checkpoint | Task, action, lifecycle/reasons or query/response payload, user authorization when required |
-| Closure | Active four-pack deletion, archived four-pack addition, index | Task, Closure, iteration, accepted candidate/snapshot |
+| Closure | Active four-pack deletion, archived four-pack addition, index | Task, Closure, iteration, accepted candidate/snapshot, post-acceptance user-authorization hash |
 
 Protocol-v3 Implementer checkpointing is deliberately ordered rather than falsely atomic:
 
@@ -525,7 +538,7 @@ For project-specific plan formats, pass each deliverable explicitly to `snapshot
 
 ## Closure and archival
 
-Close only from `ACCEPTED`.
+Close only from `ACCEPTED` plus explicit user confirmation received after the acceptance report.
 
 1. Before final acceptance, complete any authorized promotion/publication and record its identity.
    If this changes a snapshot member, keep the task active and run another
@@ -533,23 +546,31 @@ Close only from `ACCEPTED`.
 2. Prepare final status fields and links before final acceptance. Prefer root-relative links; when
    final bytes depend on archive depth, stage those exact bytes outside active/archive and review
    the staged candidate before the atomic move.
-3. Ensure deliverables live outside the task directory, remain in their named repositories, and
+3. Present the exact accepted candidate/vector, checks, residual risks, and retained deliverables
+   to the user, then stop. A prior instruction to run through archival does not count as this
+   confirmation.
+4. After a new explicit user confirmation, derive one non-secret authorization reference for this
+   archive decision. Pass that same reference to both `archive --authorization-token` and
+   `checkpoint --role closure --authorization-token`; persist only its SHA-256.
+5. Ensure deliverables live outside the task directory, remain in their named repositories, and
    every participant worktree is clean at its accepted candidate.
-4. Before moving, require the active four-pack and task index in the Reviewer commit and reject an
+6. Before moving, require the active four-pack and task index in the Reviewer commit and reject an
    ignored archive destination. After the exact archive-ready snapshot is accepted, move all four
    files together without changing their bytes; do not discard failed review history.
-5. Update the index in the same transaction: remove the active row, add an archived row with task
+7. Update the index in the same transaction: remove the active row, add an archived row with task
    link, deliverable links, final verdict, iteration count, full accepted snapshot, and
    promotion/commit identity when applicable.
-6. Confirm the task ID exists in exactly one of active or archive locations.
-7. Run `git diff --check`; include untracked files in whitespace checks; check Markdown links after
+8. Confirm the task ID exists in exactly one of active or archive locations.
+9. Run `git diff --check`; include untracked files in whitespace checks; check Markdown links after
    the move; record commands and results.
-8. Run `validate --phase archived`.
-9. Create the Closure checkpoint and require it to contain all four active deletions, all four
-   archived additions, and the index update; then require a clean loop worktree.
-10. Run the read-only `handoff` gate and return the exact control branch/Base/candidate/Closure,
+10. Run `validate --phase archived`.
+11. Create the Closure checkpoint and require it to contain all four active deletions, all four
+    archived additions, the index update, and `Ralph-Authorization-SHA256`; then require a clean
+    loop worktree.
+12. Run the read-only `handoff` gate and return the exact control branch/Base/candidate/Closure,
     snapshot, vector digest, and every participant's ID, Base, branch, candidate, changed paths,
-    merge order, deliverables, Control-event history, and validation evidence to the user.
+    merge order, deliverables, Control-event history, authorization hash, and validation evidence
+    to the user.
 
 If the move or index update changes an accepted byte or fails integrity checks, roll back to active
 state. Fix and re-review before another archive attempt; never review an already-marked archive as
@@ -560,6 +581,9 @@ the archived parent; never silently reopen, move, or rewrite the archived four-p
 
 The bundled `archive` command supports only indexes containing the Ralph marker blocks from the
 bundled `index.md` template. It refuses custom indexes rather than guessing their structure.
+Read-only handoff remains compatible with a pre-0.3.1 Closure that lacks the authorization
+trailer, but reports that legacy gap; every newly created archive and Closure must pass the gate
+above.
 
 ## Manual integration boundary
 
